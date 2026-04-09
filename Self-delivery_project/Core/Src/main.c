@@ -16,9 +16,11 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "can.h"
+#include "motor.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
+#include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -93,8 +95,11 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  printf("\r\n========================================\r\n");
-  printf(" STM32 Motor Slave — Booting\r\n");
+  /* printf 버퍼링 비활성화 — 즉시 출력 보장 */
+  setvbuf(stdout, NULL, _IONBF, 0);
+
+  printf("\r\n[DEBUG] STM32 Motor Slave Online...\r\n");
+  printf("========================================\r\n");
   printf(" CAN 500kbps | USART2 115200-8N1\r\n");
   printf("========================================\r\n");
 
@@ -124,27 +129,12 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    if (dataReceived)
+    if (dataReceived == 1)
     {
+      /* 콘솔 출력 먼저, 그 다음 모터 구동 */
+      printf("[CAN RX] ID: 0x123 | Speed: %d\r\n", (int)rxSpeed);
+      Motor_Drive((int)rxSpeed);
       dataReceived = 0;
-
-      printf("[MOTOR] CAN received (speed=%d). Starting test sequence...\r\n",
-             (int)rxSpeed);
-
-      /* ── 전진 2초 ── */
-      Motor_Drive(2000);
-      printf("[MOTOR] >> Forward  (PWM=5000)\r\n");
-      HAL_Delay(1000);
-
-      /* ── 후진 2초 ── */
-      Motor_Drive(-2000);
-      printf("[MOTOR] >> Backward (PWM=-5000)\r\n");
-      HAL_Delay(1000);
-
-      /* ── 정지 ── */
-      Motor_Drive(0);
-      printf("[MOTOR] >> Stop\r\n");
-      printf("[MOTOR] Test sequence complete.\r\n\r\n");
     }
   }
   /* USER CODE END 3 */

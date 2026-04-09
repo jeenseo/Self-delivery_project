@@ -35,6 +35,10 @@ extern CAN_HandleTypeDef hcan;
 
 /* USER CODE BEGIN Private defines */
 
+void CAN_filter(void);
+extern uint8_t dataReceived;
+extern int16_t rxSpeed;
+
 /* USER CODE END Private defines */
 
 void MX_CAN_Init(void);

@@ -78,15 +78,15 @@ if __name__ == '__main__':
     print("[CAN Bridge] 시작됨")
 
     try:
-        # 전진 80% 속도로 3초
-        print("[CMD] 전진 8000")
-        send_motor_command(bus, 8000)
-        time.sleep(3)
+        # 전진 20% 속도로 1초
+        print("[CMD] 전진 2000")
+        send_motor_command(bus, 2000)
+        time.sleep(1)
 
-        # 후진 60% 속도로 2초
-        print("[CMD] 후진 -6000")
-        send_motor_command(bus, -6000)
-        time.sleep(2)
+        # 후진 20% 속도로 1초
+        print("[CMD] 후진 -2000")
+        send_motor_command(bus, -2000)
+        time.sleep(1)
 
         # 정지
         print("[CMD] 정지")
