@@ -14,9 +14,7 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
-#include "stdio.h"
 #include "main.h"
-#include "motor.h"
 #include "can.h"
 #include "tim.h"
 #include "usart.h"
@@ -47,6 +45,7 @@
 /* USER CODE BEGIN PV */
 extern uint8_t dataReceived;   /* can.c에 정의 */
 extern int16_t rxSpeed;        /* can.c에 정의 */
+extern UART_HandleTypeDef huart2;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -133,12 +132,12 @@ int main(void)
              (int)rxSpeed);
 
       /* ── 전진 2초 ── */
-      Motor_Drive(5000);
+      Motor_Drive(2000);
       printf("[MOTOR] >> Forward  (PWM=5000)\r\n");
       HAL_Delay(1000);
 
       /* ── 후진 2초 ── */
-      Motor_Drive(-5000);
+      Motor_Drive(-2000);
       printf("[MOTOR] >> Backward (PWM=-5000)\r\n");
       HAL_Delay(1000);
 

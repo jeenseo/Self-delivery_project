@@ -16,6 +16,7 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
+/* Define to prevent recursive inclusion -------------------------------------*/
 #ifndef __CAN_H__
 #define __CAN_H__
 
@@ -26,22 +27,17 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
-/* Exported variables --------------------------------------------------------*/
-extern CAN_HandleTypeDef hcan;
-extern uint8_t           dataReceived;   /* CAN 수신 플래그                */
-extern int16_t           rxSpeed;        /* 수신 속도값 (-9999 ~ +9999)    */
-
 /* USER CODE BEGIN Includes */
 
 /* USER CODE END Includes */
+
+extern CAN_HandleTypeDef hcan;
 
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
 
-/* Exported functions --------------------------------------------------------*/
 void MX_CAN_Init(void);
-void CAN_filter(void);
 
 /* USER CODE BEGIN Prototypes */
 
@@ -52,3 +48,4 @@ void CAN_filter(void);
 #endif
 
 #endif /* __CAN_H__ */
+

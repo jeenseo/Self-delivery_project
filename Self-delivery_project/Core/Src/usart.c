@@ -111,4 +111,18 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 
 /* USER CODE BEGIN 1 */
 
+#include <stdio.h>
+
+/**
+  * @brief printf 함수가 호출될 때 내부적으로 실행되는 함수입니다.
+  * ptr에 담긴 문자열을 huart2(USART2)를 통해 전송합니다.
+  */
+int _write(int file, char *ptr, int len)
+{
+  // HAL_UART_Transmit을 사용하여 huart2로 데이터를 쏩니다.
+  // 타임아웃을 충분히(HAL_MAX_DELAY) 주어 데이터 누락을 방지합니다.
+  HAL_UART_Transmit(&huart2, (uint8_t *)ptr, (uint16_t)len, HAL_MAX_DELAY);
+  return len;
+}
+
 /* USER CODE END 1 */
