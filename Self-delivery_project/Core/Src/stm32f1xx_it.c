@@ -22,46 +22,12 @@
 #include "stm32f1xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-extern TIM_HandleTypeDef htim2;
-extern TIM_HandleTypeDef htim3;
 extern CAN_HandleTypeDef hcan;
-extern UART_HandleTypeDef huart3;
-
-extern volatile uint32_t echo_start_L;
-extern volatile uint32_t echo_end_L;
-extern volatile uint8_t echo_captured_L;
-
-extern volatile uint32_t echo_start_R;
-extern volatile uint32_t echo_end_R;
-extern volatile uint8_t echo_captured_R;
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-    // 왼쪽 ECHO (PA5)
-    if (GPIO_Pin == GPIO_PIN_8) {
-        if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_8) == GPIO_PIN_SET)
-            echo_start_L = __HAL_TIM_GET_COUNTER(&htim3);
-        else {
-            echo_end_L = __HAL_TIM_GET_COUNTER(&htim3);
-            echo_captured_L = 1;
-        }
-    }
 
-    else if (GPIO_Pin == GPIO_PIN_9) {
-           if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_9) == GPIO_PIN_SET)
-               echo_start_R = __HAL_TIM_GET_COUNTER(&htim3);
-           else {
-               echo_end_R = __HAL_TIM_GET_COUNTER(&htim3);
-               echo_captured_R = 1;
-           }
-       }
-
-    // 오른쪽 ECHO (PA0 이라고 했었는데 지금은 어디에 연결했는지 정확히 확인 필요)
-
-}
 /* USER CODE END TD */
 
 /* Private define ------------------------------------------------------------*/
@@ -91,7 +57,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
 /* External variables --------------------------------------------------------*/
 extern CAN_HandleTypeDef hcan;
-extern UART_HandleTypeDef huart3;
+extern UART_HandleTypeDef huart2;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -263,18 +229,34 @@ void USB_LP_CAN1_RX0_IRQHandler(void)
 }
 
 /**
-  * @brief This function handles USART3 global interrupt.
+  * @brief This function handles CAN RX1 interrupt.
   */
-void USART3_IRQHandler(void)
+void CAN1_RX1_IRQHandler(void)
 {
-  /* USER CODE BEGIN USART3_IRQn 0 */
+  /* USER CODE BEGIN CAN1_RX1_IRQn 0 */
 
-  /* USER CODE END USART3_IRQn 0 */
-  HAL_UART_IRQHandler(&huart3);
-  /* USER CODE BEGIN USART3_IRQn 1 */
+  /* USER CODE END CAN1_RX1_IRQn 0 */
+  HAL_CAN_IRQHandler(&hcan);
+  /* USER CODE BEGIN CAN1_RX1_IRQn 1 */
 
-  /* USER CODE END USART3_IRQn 1 */
+  /* USER CODE END CAN1_RX1_IRQn 1 */
+}
+
+/**
+  * @brief This function handles USART2 global interrupt.
+  */
+void USART2_IRQHandler(void)
+{
+  /* USER CODE BEGIN USART2_IRQn 0 */
+
+  /* USER CODE END USART2_IRQn 0 */
+  HAL_UART_IRQHandler(&huart2);
+  /* USER CODE BEGIN USART2_IRQn 1 */
+
+  /* USER CODE END USART2_IRQn 1 */
 }
 
 /* USER CODE BEGIN 1 */
+
+
 /* USER CODE END 1 */
