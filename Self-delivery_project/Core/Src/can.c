@@ -5,8 +5,9 @@
   * @brief   CAN1 초기화 및 수신 처리 — STM32 모터 슬레이브
   *
   *  프로토콜 (Pi → STM32, CAN ID 0x123):
-  *    Byte 0~1 : int16_t speed  Big-Endian  (-9999 ~ +9999)
-  *    Byte 2~7 : 예약 (0x00)
+  *    Byte 0~1 : int16_t Left  Motor Speed  Big-Endian  (-9999 ~ +9999)
+  *    Byte 2~3 : int16_t Right Motor Speed  Big-Endian  (-9999 ~ +9999)
+  *    (총 4바이트)
   *
   *  비트레이트 계산:
   *    PCLK1 = 36 MHz,  Prescaler = 6  → TQ clock = 6 MHz
@@ -18,6 +19,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "can.h"
+#include "motor.h"
 
 /* USER CODE BEGIN 0 */
 
@@ -29,12 +31,13 @@ CAN_HandleTypeDef   hcan;
 CAN_RxHeaderTypeDef rxHeader;
 uint8_t             rxData[8];
 
-uint8_t             dataReceived = 0;   /* CAN 수신 플래그 (main 루프용) */
-int16_t             rxSpeed      = 0;   /* 수신 속도값 (-9999 ~ +9999)  */
+uint8_t             dataReceived = 0;        /* CAN 수신 플래그 (main 루프용) */
+int16_t             rxLeftSpeed  = 0;        /* 수신 좌측 속도 (-9999 ~ +9999) */
+int16_t             rxRightSpeed = 0;        /* 수신 우측 속도 (-9999 ~ +9999) */
 
-/* ── CAN_filter ─────────────────────────────────────────────────────────
- *   Pass-All 필터: 모든 CAN ID 수신 허용
- * ───────────────────────────────────────────────────────────────────── */
+/* ── CAN_filter ─────────────────────────────────────────────────────────────
+ *   Pass-All 필터: 모든 CAN ID 수신 허용 (테스트용)
+ * ──────────────────────────────────────────────────────────────────────── */
 void CAN_filter(void)
 {
     CAN_FilterTypeDef sFilterConfig;
@@ -44,7 +47,7 @@ void CAN_filter(void)
     sFilterConfig.FilterScale          = CAN_FILTERSCALE_32BIT;
     sFilterConfig.FilterIdHigh         = 0x0000;
     sFilterConfig.FilterIdLow          = 0x0000;
-    sFilterConfig.FilterMaskIdHigh     = 0x0000;
+    sFilterConfig.FilterMaskIdHigh     = 0x0000;   /* Mask=0 → 모든 ID 통과 */
     sFilterConfig.FilterMaskIdLow      = 0x0000;
     sFilterConfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
     sFilterConfig.FilterActivation     = ENABLE;
@@ -54,24 +57,27 @@ void CAN_filter(void)
         Error_Handler();
 }
 
-/* ── HAL_CAN_RxFifo0MsgPendingCallback ───────────────────────────────────
- *   ISR 내부에서는 플래그와 데이터 파싱만 수행
- *   printf / UART 전송은 절대 호출하지 않음 (main 루프에서 처리)
+/* ── HAL_CAN_RxFifo0MsgPendingCallback ─────────────────────────────────────
+ *   ISR 내부: 데이터 파싱 + 플래그 세팅만 수행 (printf/UART 금지)
+ *   main 루프에서 dataReceived 확인 후 Motor_Drive 호출
  * ──────────────────────────────────────────────────────────────────────── */
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan_ptr)
 {
     if (HAL_CAN_GetRxMessage(hcan_ptr, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)
     {
-        /* Byte 0~1: Big-Endian int16_t speed */
-        rxSpeed      = (int16_t)((rxData[0] << 8) | rxData[1]);
-        dataReceived = 1;   /* main 루프에 처리 요청 */
+        /* Byte 0~1: Left Speed  (Big-Endian int16_t) */
+        rxLeftSpeed  = (int16_t)((rxData[0] << 8) | rxData[1]);
+        /* Byte 2~3: Right Speed (Big-Endian int16_t) */
+        rxRightSpeed = (int16_t)((rxData[2] << 8) | rxData[3]);
+
+        /* main 루프에 처리 요청 */
+        dataReceived = 1;
     }
 }
 
 /* ── MX_CAN_Init ──────────────────────────────────────────────────────────
  *   CAN1 500 kbps 초기화
- *   PCLK1=36MHz / Prescaler=6 → TQ=6MHz
- *   1 + BS1(9) + BS2(2) = 12TQ → 500kbps
+ *   PCLK1=36MHz / Prescaler=6 / BS1=9TQ / BS2=2TQ → 500kbps
  * ──────────────────────────────────────────────────────────────────────── */
 void MX_CAN_Init(void)
 {
@@ -101,8 +107,9 @@ void MX_CAN_Init(void)
 }
 
 /* ── HAL_CAN_MspInit ─────────────────────────────────────────────────────
- *   PA11 → CAN_RX,  PA12 → CAN_TX
- *   IRQ  : USB_LP_CAN1_RX0_IRQn 만 활성화 (TX/RX1 불필요)
+ *   PA11 → CAN_RX (Input Floating)
+ *   PA12 → CAN_TX (AF Push-Pull)
+ *   IRQ  : USB_LP_CAN1_RX0_IRQn 만 활성화
  * ──────────────────────────────────────────────────────────────────────── */
 void HAL_CAN_MspInit(CAN_HandleTypeDef *canHandle)
 {

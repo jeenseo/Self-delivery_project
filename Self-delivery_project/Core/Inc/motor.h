@@ -1,4 +1,4 @@
-/* motor.h — STM32 Motor Slave Interface */
+/* motor.h — STM32 스키드-스티어 모터 슬레이브 인터페이스 */
 #ifndef __MOTOR_H__
 #define __MOTOR_H__
 
@@ -11,17 +11,17 @@ extern "C" {
 /**
  * Motor_Drive
  * -----------
- * speed > 0 : 전진  (htim2/htim1 CH1,CH2 = speed, 전진 GPIO)
- * speed < 0 : 후진  (htim2/htim1 CH1,CH2 = |speed|, 후진 GPIO)
- * speed = 0 : 정지
+ * 좌/우 모터 독립 속도 제어 (스키드-스티어)
  *
- * PWM: htim2 TIM_CHANNEL_1/2, htim1 TIM_CHANNEL_1/2
- * DIR: GPIOC PIN 0/1/2/3/5/6/8/9
- * 범위: -9999 ~ +9999
+ * @param left   좌측 속도 (-9999 ~ +9999)  양수=전진, 음수=후진, 0=정지
+ * @param right  우측 속도 (-9999 ~ +9999)
+ *
+ * PWM : htim2 CH1(R앞), htim2 CH2(L앞), htim1 CH1(R뒤), htim1 CH2(L뒤)
+ * DIR : GPIOC  PC0/1(R앞), PC2/3(L앞), PC5/6(R뒤), PC8/9(L뒤)
  */
-void Motor_Drive(int speed);
+void Motor_Drive(int16_t left, int16_t right);
 
-/** 전체 모터 즉시 정지 (방향 핀 초기화 + PWM = 0) */
+/** 모든 모터 즉시 정지 */
 void Motor_Stop(void);
 
 #ifdef __cplusplus
