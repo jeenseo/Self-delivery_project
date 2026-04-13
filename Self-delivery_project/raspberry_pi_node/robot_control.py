@@ -21,17 +21,24 @@ CAN 프로토콜 (STM32 수신):
   형식  : Big-Endian, 총 4바이트
 
 의존성:
-  pip install python-can rplidar pynput
+  pip install python-can rplidar
+  (pynput 불필요 — 표준 라이브러리 termios/select 사용)
 """
 
-import time
+import atexit
+import os
+import select
+import signal
 import struct
+import sys
+import termios
 import threading
+import time
+import tty
 import logging
 
 import can
 from rplidar import RPLidar
-from pynput import keyboard
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  튜닝 상수 (실제 로봇에 맞게 조정)
@@ -73,6 +80,7 @@ AUTO_MODE   = 'AUTO'
 _mode      = MANUAL_MODE
 _mode_lock = threading.Lock()
 
+# 현재 눌린 키 집합 — 문자열 식별자: 'UP', 'DOWN', 'LEFT', 'RIGHT'
 _keys_pressed = set()
 _key_lock     = threading.Lock()
 
@@ -183,47 +191,133 @@ def _sleep_or_interrupt(seconds: float, check_interval: float = 0.05) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  키보드 리스너 (pynput 논블로킹 스레드)
+#  터미널 I/O — Wayland 호환 키보드 입력
+#  (pynput 대체: 표준 라이브러리 termios + select 사용)
 # ──────────────────────────────────────────────────────────────────────────────
-def _on_press(key) -> None:
+_orig_terminal_attrs = None   # 원본 터미널 설정 저장
+
+
+def _restore_terminal() -> None:
+    """원본 터미널 상태를 복원합니다. atexit 에 등록됩니다."""
+    global _orig_terminal_attrs
+    if _orig_terminal_attrs is not None:
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _orig_terminal_attrs)
+        except Exception:
+            pass
+        _orig_terminal_attrs = None
+
+
+def _set_terminal_cbreak() -> None:
+    """
+    stdin을 cbreak 모드로 전환합니다.
+    - 키 입력이 즉시 전달됩니다 (Enter 불필요).
+    - Ctrl+C (ISIG) 는 여전히 SIGINT를 발생시킵니다.
+    - atexit 에 _restore_terminal 을 등록합니다.
+    """
+    global _orig_terminal_attrs
+    fd = sys.stdin.fileno()
+    _orig_terminal_attrs = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    atexit.register(_restore_terminal)
+
+
+def _keyboard_thread() -> None:
+    """
+    백그라운드 데몬 스레드: 터미널에서 논블로킹으로 키 입력을 읽습니다.
+
+    처리 규칙:
+      'm'        → MANUAL ↔ AUTO 모드 전환
+      ESC[A (↑)  → _keys_pressed = {'UP'}
+      ESC[B (↓)  → _keys_pressed = {'DOWN'}
+      ESC[D (←)  → _keys_pressed = {'LEFT'}
+      ESC[C (→)  → _keys_pressed = {'RIGHT'}
+      0x03       → SIGINT 전송 (Ctrl+C 안전 종료)
+      타임아웃   → _keys_pressed.clear() (키 릴리즈 처리)
+    """
     global _mode
-    with _key_lock:
-        _keys_pressed.add(key)
+    _set_terminal_cbreak()
 
-    # 'm' 키: 모드 전환
-    try:
-        if key.char == 'm':
-            with _mode_lock:
-                if _mode == MANUAL_MODE:
-                    _mode = AUTO_MODE
-                    log.info('[MODE] MANUAL → AUTO')
-                else:
-                    _mode = MANUAL_MODE
-                    log.info('[MODE] AUTO → MANUAL')
-    except AttributeError:
-        pass  # 특수키 (Key.up 등) 는 .char 없음
+    # ANSI 방향키 이스케이프 코드 맵
+    ESCAPE_MAP = {
+        '[A': 'UP',
+        '[B': 'DOWN',
+        '[C': 'RIGHT',
+        '[D': 'LEFT',
+    }
 
+    log.info('[KB] 터미널 키보드 스레드 시작 (cbreak 모드)')
 
-def _on_release(key) -> None:
-    with _key_lock:
-        _keys_pressed.discard(key)
+    while True:
+        try:
+            # 0.1초 타임아웃으로 논블로킹 대기
+            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+
+            if not ready:
+                # ── 타임아웃: 키가 눌리지 않음 → 릴리즈 처리 ──────
+                with _key_lock:
+                    _keys_pressed.clear()
+                continue
+
+            ch = sys.stdin.read(1)
+
+            # ── Ctrl+C 안전 처리 ─────────────────────────────────
+            if ch == '\x03':
+                log.info('[KB] Ctrl+C 감지 — SIGINT 전송')
+                os.kill(os.getpid(), signal.SIGINT)
+                break
+
+            # ── 모드 전환 ────────────────────────────────────────
+            elif ch == 'm':
+                with _mode_lock:
+                    if _mode == MANUAL_MODE:
+                        _mode = AUTO_MODE
+                        log.info('[MODE] MANUAL → AUTO')
+                    else:
+                        _mode = MANUAL_MODE
+                        log.info('[MODE] AUTO → MANUAL')
+                # 모드 전환 시 키 집합 초기화
+                with _key_lock:
+                    _keys_pressed.clear()
+
+            # ── 방향키 (ANSI 이스케이프 시퀀스) ─────────────────
+            elif ch == '\x1b':
+                # ESC 다음 최대 0.05초 내 추가 바이트 읽기
+                more_ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if more_ready:
+                    seq = sys.stdin.read(2)   # '[A', '[B', '[C', '[D'
+                    key_id = ESCAPE_MAP.get(seq)
+                    if key_id:
+                        with _key_lock:
+                            _keys_pressed.clear()
+                            _keys_pressed.add(key_id)
+                # else: 단독 ESC → 무시
+
+            # ── 그 외 키 → 무시 ──────────────────────────────────
+            else:
+                with _key_lock:
+                    _keys_pressed.clear()
+
+        except Exception as e:
+            log.error('[KB] 스레드 오류: %s', e)
+            break
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  수동 모드 명령 계산
 # ──────────────────────────────────────────────────────────────────────────────
-def _get_manual_command() -> tuple[int, int]:
+def _get_manual_command() -> tuple:
     """현재 눌린 키로 (left, right) 속도 반환. 아무 키도 없으면 (0, 0)."""
     with _key_lock:
         pressed = set(_keys_pressed)
 
-    if keyboard.Key.up in pressed:
+    if 'UP' in pressed:
         return FORWARD_SPEED, FORWARD_SPEED           # 전진
-    elif keyboard.Key.down in pressed:
+    elif 'DOWN' in pressed:
         return -FORWARD_SPEED, -FORWARD_SPEED          # 후진
-    elif keyboard.Key.left in pressed:
+    elif 'LEFT' in pressed:
         return -TURN_SPEED, TURN_SPEED                 # 좌 포인트 턴
-    elif keyboard.Key.right in pressed:
+    elif 'RIGHT' in pressed:
         return TURN_SPEED, -TURN_SPEED                 # 우 포인트 턴
     else:
         return 0, 0
@@ -326,24 +420,50 @@ def main() -> None:
     log.info('[INIT] CAN 버스 초기화 (%s @ 500kbps)', CAN_CHANNEL)
     bus = can.interface.Bus(channel=CAN_CHANNEL, bustype=CAN_BUSTYPE)
 
-    # ── LiDAR 초기화 ─────────────────────────────────────────
+    # ── LiDAR 초기화 (강화 시퀀스) ───────────────────────────
+    lidar = None
     log.info('[INIT] LiDAR 초기화 (%s)', LIDAR_PORT)
-    lidar = RPLidar(LIDAR_PORT, baudrate=LIDAR_BAUD)
-    lidar.start_motor()
-    time.sleep(2.0)  # 모터 워밍업
+    try:
+        lidar = RPLidar(LIDAR_PORT, baudrate=LIDAR_BAUD)
 
-    lidar_t = threading.Thread(target=_lidar_thread, args=(lidar,), daemon=True)
-    lidar_t.start()
+        # Step 1: 하드웨어 리셋 — 이전 세션의 junk 상태 제거
+        log.info('[INIT] LiDAR 하드웨어 리셋 중...')
+        lidar.reset()
 
-    log.info('[INIT] LiDAR 첫 스캔 대기...')
-    _lidar_ready.wait(timeout=10.0)
-    if not _lidar_ready.is_set():
-        log.warning('[INIT] LiDAR 스캔 타임아웃 — 계속 진행합니다.')
+        # Step 2: 센서 리부팅 완료 대기 (최소 2초)
+        log.info('[INIT] 리부팅 대기 (2.0s)...')
+        time.sleep(2.0)
 
-    # ── 키보드 리스너 시작 ────────────────────────────────────
-    listener = keyboard.Listener(on_press=_on_press, on_release=_on_release)
-    listener.start()
-    log.info('[INIT] 키보드 리스너 시작')
+        # Step 3: 시리얼 입력 버퍼 플러시 — 남은 junk 바이트 제거
+        log.info('[INIT] 시리얼 버퍼 플러시...')
+        lidar._serial.reset_input_buffer()
+
+        # Step 4: 정상 순서로 모터 시작
+        lidar.start_motor()
+        log.info('[INIT] LiDAR 모터 시작 완료')
+
+    except Exception as e:
+        log.error('[INIT] LiDAR 초기화 실패: %s', e)
+        log.warning('[INIT] LiDAR 없이 계속 진행합니다 (AUTO 모드 비활성화).')
+        lidar = None
+
+    # ── LiDAR 백그라운드 스레드 시작 ─────────────────────────
+    if lidar is not None:
+        lidar_t = threading.Thread(target=_lidar_thread, args=(lidar,), daemon=True)
+        lidar_t.start()
+
+        log.info('[INIT] LiDAR 첫 스캔 대기...')
+        _lidar_ready.wait(timeout=10.0)
+        if not _lidar_ready.is_set():
+            log.warning('[INIT] LiDAR 스캔 타임아웃 — 계속 진행합니다.')
+    else:
+        # LiDAR 없음: 전방 거리를 무한대로 유지 (항상 전진)
+        _lidar_ready.set()
+
+    # ── 터미널 키보드 스레드 시작 (Wayland 호환) ─────────────
+    kb_thread = threading.Thread(target=_keyboard_thread, daemon=True)
+    kb_thread.start()
+    log.info('[INIT] 키보드 스레드 시작 (termios/select)')
 
     motor_stop(bus)
     log.info('[INIT] 준비 완료. 현재 모드: %s', _mode)
@@ -381,10 +501,16 @@ def main() -> None:
 
     finally:
         motor_stop(bus)
-        listener.stop()
-        lidar.stop()
-        lidar.stop_motor()
-        lidar.disconnect()
+        _restore_terminal()   # 터미널 상태 즉시 복원
+
+        if lidar is not None:
+            try:
+                lidar.stop()
+                lidar.stop_motor()
+                lidar.disconnect()
+            except Exception:
+                pass
+
         bus.shutdown()
         log.info('[EXIT] 정상 종료.')
 

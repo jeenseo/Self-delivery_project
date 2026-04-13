@@ -1,5 +1,3 @@
-../Core/Src/motor.c:26:13:Direction_Forward	8	static
-../Core/Src/motor.c:38:13:Direction_Backward	8	static
-../Core/Src/motor.c:50:13:Direction_Stop	8	static
-../Core/Src/motor.c:71:6:Motor_Drive	24	static
-../Core/Src/motor.c:105:6:Motor_Stop	8	static
+../Core/Src/motor.c:40:13:_set_side	32	static
+../Core/Src/motor.c:96:6:Motor_Drive	40	static
+../Core/Src/motor.c:120:6:Motor_Stop	8	static
