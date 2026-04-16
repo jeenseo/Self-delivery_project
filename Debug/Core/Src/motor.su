@@ -1,3 +1,0 @@
-../Core/Src/motor.c:40:13:_set_side	32	static
-../Core/Src/motor.c:96:6:Motor_Drive	40	static
-../Core/Src/motor.c:120:6:Motor_Stop	8	static
