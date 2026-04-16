@@ -63,19 +63,22 @@ class MotorNode(Node):
     # ── /cmd_vel 콜백 ─────────────────────────────────────────────
     def _cmd_vel_cb(self, msg: Twist) -> None:
         """
-        Twist → 스키드-스티어 L/R 속도 변환 후 CAN 전송.
+        Twist → 수정된 스키드-스티어 믹싱 후 CAN 전송.
 
-        스키드-스티어 믹싱:
-          linear.x  : 전후진 기여
-          angular.z : 차동 기여 (양수 = 좌회전)
-          left  = (linear - angular) × max_speed
-          right = (linear + angular) × max_speed
+        물리 역분석 결과 (Up→전진, Left→좌회전 보장):
+          Physical v = k*(L-R),  Physical ω = k*(L+R)
+          역산:
+            left  = (linear + angular) × max_speed
+            right = (angular − linear) × max_speed
+
+          Up   (linear=+1, ω=0) → L=+N, R=-N → 물리 전진 ✓
+          Left (ω=+1, v=0)      → L=+N, R=+N → 물리 좌회전 ✓
         """
         linear  = max(-1.0, min(1.0, float(msg.linear.x)))
         angular = max(-1.0, min(1.0, float(msg.angular.z)))
 
-        left  = int((linear - angular) * self._max_speed)
-        right = int((linear + angular) * self._max_speed)
+        left  = int((linear + angular) * self._max_speed)
+        right = int((angular - linear) * self._max_speed)
         left  = max(-self._max_speed, min(self._max_speed, left))
         right = max(-self._max_speed, min(self._max_speed, right))
 
