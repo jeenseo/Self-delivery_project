@@ -1,0 +1,12 @@
+# Non-ROS pip dependencies (PEP 668: use venv or --break-system-packages)
+# ROS 2 packages (rclpy, sensor_msgs, etc.) are installed via apt.
+#
+# Install command:
+#   pip install -r requirements.txt --break-system-packages
+# Or inside venv:
+#   python3 -m venv ~/robot_venv && source ~/robot_venv/bin/activate
+#   pip install -r requirements.txt
+
+python-can>=4.0.0
+rplidar-roboticia>=0.9.0
+pyserial>=3.5

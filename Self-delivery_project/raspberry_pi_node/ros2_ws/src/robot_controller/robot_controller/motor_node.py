@@ -3,21 +3,19 @@ motor_node.py
 =============
 ROS 2 Node: /cmd_vel → CAN 4-바이트 모터 명령 변환기
 
-수정된 믹싱 공식 (물리 역분석 결과):
-  Physical v = k*(L - R),  Physical ω = k*(L + R)
-  → 역산:
-      left  = (linear + angular) × N
-      right = (angular − linear) × N
-
-  Up   (linear=+1, ω=0) → L=+N, R=-N → 물리 전진 ✓
-  Down (linear=-1, ω=0) → L=-N, R=+N → 물리 후진 ✓
-  Left (ω=+1, v=0)      → L=+N, R=+N → 물리 좌회전 ✓
-  Right(ω=-1, v=0)      → L=-N, R=-N → 물리 우회전 ✓
+토픽 입력:
+  /cmd_vel  (geometry_msgs/Twist)
+    linear.x  : [-1.0, +1.0]  전진(+) / 후진(-)
+    angular.z : [-1.0, +1.0]  좌회전(+) / 우회전(-)
 
 CAN 출력:
   ID    : 0x123 (11-bit 표준)
   Byte 0-1 : int16_t Left  Motor Speed  Big-Endian  (-9999 ~ +9999)
   Byte 2-3 : int16_t Right Motor Speed  Big-Endian  (-9999 ~ +9999)
+
+스키드-스티어 믹싱:
+  left  = (linear - angular) × max_speed
+  right = (linear + angular) × max_speed
 
 파라미터:
   can_channel  str  'can0'
@@ -51,9 +49,7 @@ class MotorNode(Node):
         # ── CAN 버스 초기화 ───────────────────────────────────────
         try:
             self._bus = can.interface.Bus(channel=channel, bustype='socketcan')
-            self.get_logger().info(
-                f'CAN 버스 초기화 완료 ({channel}, ID=0x{self._can_id:03X})'
-            )
+            self.get_logger().info(f'CAN 버스 초기화 완료 ({channel}, ID=0x{self._can_id:03X})')
         except Exception as exc:
             self.get_logger().fatal(f'CAN 버스 초기화 실패: {exc}')
             raise
@@ -67,17 +63,19 @@ class MotorNode(Node):
     # ── /cmd_vel 콜백 ─────────────────────────────────────────────
     def _cmd_vel_cb(self, msg: Twist) -> None:
         """
-        Twist → 수정된 스키드-스티어 믹싱 후 CAN 전송.
+        Twist → 스키드-스티어 L/R 속도 변환 후 CAN 전송.
 
-        물리 역분석에 의한 수정 공식:
-          left  = (linear + angular) × max_speed
-          right = (angular − linear) × max_speed
+        스키드-스티어 믹싱:
+          linear.x  : 전후진 기여
+          angular.z : 차동 기여 (양수 = 좌회전)
+          left  = (linear - angular) × max_speed
+          right = (linear + angular) × max_speed
         """
         linear  = max(-1.0, min(1.0, float(msg.linear.x)))
         angular = max(-1.0, min(1.0, float(msg.angular.z)))
 
-        left  = int((linear + angular) * self._max_speed)
-        right = int((angular - linear) * self._max_speed)
+        left  = int((linear - angular) * self._max_speed)
+        right = int((linear + angular) * self._max_speed)
         left  = max(-self._max_speed, min(self._max_speed, left))
         right = max(-self._max_speed, min(self._max_speed, right))
 

@@ -1,0 +1,9 @@
+__pycache__/
+.venv/
+*.pyc
+*.log
+
+# ROS 2 colcon 빌드 결과물 (Raspberry Pi ARM 바이너리 — Git 불포함)
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/

@@ -3,51 +3,36 @@ avoidance_node.py
 =================
 ROS 2 Node: 장애물 회피 자율 주행 (AUTO 모드)
 
-비대칭 바운딩박스 기반 위협 감지:
-  LiDAR 중심 (0,0) 기준:
-    전방: 6.5 cm  + 40 cm 마진 = 46.5 cm
-    좌측: 17.0 cm + 40 cm 마진 = 57.0 cm
-    우측: 17.5 cm + 40 cm 마진 = 57.5 cm
-    후방: 37.0 cm + 40 cm 마진 = 77.0 cm  (후방 회피는 미사용)
-
-위협 판정 알고리즘:
-  각 LiDAR 점 → 직교좌표 변환:
-    x = dist * cos(angle)   [전방 +]
-    y = dist * sin(angle)   [좌측 +]
-  전방 코리더 조건: x > 0  AND  -RIGHT_SAFE ≤ y ≤ LEFT_SAFE
-  코리더 내 최소 x ≤ FRONT_SAFE → 회피 발동
-
 토픽 입력:
-  /scan              (sensor_msgs/LaserScan) — 원시 스캔 (mm 단위 range)
-  /mode              (std_msgs/String)        — "MANUAL" | "AUTO"
+  /forward_distance  (std_msgs/Float32)   — 전방 최소 거리 (cm), -1 = 미수신
+  /mode              (std_msgs/String)    — "MANUAL" | "AUTO"
 
 토픽 출력:
-  /cmd_vel           (geometry_msgs/Twist)    — AUTO 모드일 때만 게시
+  /cmd_vel           (geometry_msgs/Twist) — AUTO 모드일 때만 게시
 
-상태머신 (10Hz 타이머):
-  FORWARD → STOP_BEFORE_TURN → TURN_LEFT_1 → RECHECK
-         → (막힘) BACKWARD → TURN_LEFT_2 → FORWARD
+상태머신 (10Hz 타이머 기반):
+  FORWARD        → 전진
+  STOP_BEFORE_TURN → 0.2s 정지
+  TURN_LEFT_1    → 좌 포인트 턴 (turn_sec)
+  RECHECK        → 0.1s 대기 후 거리 재확인
+  BACKWARD       → 후진 (back_sec)
+  TURN_LEFT_2    → 2차 좌 포인트 턴 (turn_sec)
 
 파라미터:
-  front_body_cm      float  6.5    차체 전방 돌출 (LiDAR 기준)
-  left_body_cm       float  17.0   차체 좌측 폭
-  right_body_cm      float  17.5   차체 우측 폭
-  safety_margin_cm   float  40.0   전방향 안전 마진
-  turn_10deg_sec     float  0.2
-  backward_10cm_sec  float  0.5
-  forward_speed      float  0.2002 (= 2000/9999)
-  turn_speed         float  0.2002
+  obstacle_dist_cm   float  50.0   (장애물 감지 임계 거리)
+  turn_10deg_sec     float  0.2    (10도 회전 시간)
+  backward_10cm_sec  float  0.5    (10cm 후진 시간)
+  forward_speed      float  0.2002 (전진 정규화 속도 = 2000/9999)
+  turn_speed         float  0.2002 (회전 정규화 속도)
 """
 
-import math
 import threading
 import time
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import Float32, String
 
 
 class AvoidanceNode(Node):
@@ -56,38 +41,22 @@ class AvoidanceNode(Node):
         super().__init__('avoidance_node')
 
         # ── 파라미터 선언 ─────────────────────────────────────────
-        self.declare_parameter('front_body_cm',     6.5)
-        self.declare_parameter('left_body_cm',      17.0)
-        self.declare_parameter('right_body_cm',     17.5)
-        self.declare_parameter('safety_margin_cm',  40.0)
-        self.declare_parameter('turn_10deg_sec',    0.2)
-        self.declare_parameter('backward_10cm_sec', 0.5)
-        self.declare_parameter('forward_speed',     0.2002)
-        self.declare_parameter('turn_speed',        0.2002)
+        self.declare_parameter('obstacle_dist_cm',   50.0)
+        self.declare_parameter('turn_10deg_sec',     0.2)
+        self.declare_parameter('backward_10cm_sec',  0.5)
+        self.declare_parameter('forward_speed',      0.2002)
+        self.declare_parameter('turn_speed',         0.2002)
 
-        margin = self.get_parameter('safety_margin_cm').value
-
-        # 안전 경계 (차체 치수 + 마진)
-        self._FRONT_SAFE = self.get_parameter('front_body_cm').value + margin
-        self._LEFT_SAFE  = self.get_parameter('left_body_cm').value  + margin
-        self._RIGHT_SAFE = self.get_parameter('right_body_cm').value + margin
-
-        self._turn_sec = self.get_parameter('turn_10deg_sec').value
-        self._back_sec = self.get_parameter('backward_10cm_sec').value
-        self._fwd_spd  = self.get_parameter('forward_speed').value
-        self._trn_spd  = self.get_parameter('turn_speed').value
-
-        self.get_logger().info(
-            f'바운딩박스 안전 구역: '
-            f'전방={self._FRONT_SAFE:.1f}cm  '
-            f'좌={self._LEFT_SAFE:.1f}cm  '
-            f'우={self._RIGHT_SAFE:.1f}cm'
-        )
+        self._obs_dist  = self.get_parameter('obstacle_dist_cm').value
+        self._turn_sec  = self.get_parameter('turn_10deg_sec').value
+        self._back_sec  = self.get_parameter('backward_10cm_sec').value
+        self._fwd_spd   = self.get_parameter('forward_speed').value
+        self._trn_spd   = self.get_parameter('turn_speed').value
 
         # ── 공유 상태 ─────────────────────────────────────────────
-        self._lock         = threading.Lock()
-        self._mode         = 'MANUAL'
-        self._threat_dist  = float('inf')   # 전방 위협 거리 (cm)
+        self._lock     = threading.Lock()
+        self._mode     = 'MANUAL'
+        self._dist_cm  = float('inf')
 
         # ── 상태머신 ──────────────────────────────────────────────
         self._state       = 'FORWARD'
@@ -95,9 +64,8 @@ class AvoidanceNode(Node):
 
         # ── 토픽 게시자 / 구독자 ──────────────────────────────────
         self._cmd_pub  = self.create_publisher(Twist, '/cmd_vel', 10)
-
-        self._sub_scan = self.create_subscription(
-            LaserScan, '/scan', self._scan_cb, 10
+        self._sub_dist = self.create_subscription(
+            Float32, '/forward_distance', self._dist_cb, 10
         )
         self._sub_mode = self.create_subscription(
             String, '/mode', self._mode_cb, 10
@@ -106,40 +74,13 @@ class AvoidanceNode(Node):
         # ── 10Hz 상태머신 타이머 ──────────────────────────────────
         self._timer = self.create_timer(0.1, self._tick)
 
-        self.get_logger().info('AvoidanceNode 준비 완료 (비대칭 바운딩박스, 10Hz)')
+        self.get_logger().info('AvoidanceNode 준비 완료 (10Hz)')
 
-    # ── LaserScan 콜백: 비대칭 바운딩박스 위협 판정 ──────────────
-    def _scan_cb(self, msg: LaserScan) -> None:
-        """
-        각 LiDAR 점을 직교좌표로 변환 후
-        전방 코리더(-RIGHT_SAFE ≤ y ≤ LEFT_SAFE, x > 0) 내
-        최소 x 거리를 threat_dist 로 저장합니다.
-        """
-        threat = float('inf')
-        n = len(msg.ranges)
-
-        for i, r_m in enumerate(msg.ranges):
-            # 유효 범위 체크
-            if r_m <= msg.range_min or r_m >= msg.range_max or r_m == 0.0:
-                continue
-
-            # 각도 계산 (라디안, 0 = 전방)
-            angle_rad = msg.angle_min + i * msg.angle_increment
-
-            # 직교좌표 변환 (단위: cm)
-            r_cm = r_m * 100.0
-            x_cm = r_cm * math.cos(angle_rad)   # 전방 +
-            y_cm = r_cm * math.sin(angle_rad)   # 좌측 +
-
-            # 전방 코리더 내 점만 위협으로 판정
-            if x_cm > 0.0 and (-self._RIGHT_SAFE <= y_cm <= self._LEFT_SAFE):
-                if x_cm < threat:
-                    threat = x_cm
-
+    # ── 콜백 ──────────────────────────────────────────────────────
+    def _dist_cb(self, msg: Float32) -> None:
         with self._lock:
-            self._threat_dist = threat
+            self._dist_cm = float(msg.data) if msg.data >= 0 else float('inf')
 
-    # ── /mode 콜백 ────────────────────────────────────────────────
     def _mode_cb(self, msg: String) -> None:
         with self._lock:
             old        = self._mode
@@ -160,8 +101,8 @@ class AvoidanceNode(Node):
     # ── 상태머신 틱 (10Hz 타이머) ─────────────────────────────────
     def _tick(self) -> None:
         with self._lock:
-            mode   = self._mode
-            threat = self._threat_dist
+            mode = self._mode
+            dist = self._dist_cm
 
         if mode != 'AUTO':
             return
@@ -171,12 +112,11 @@ class AvoidanceNode(Node):
 
         # ── FORWARD ──────────────────────────────────────────────
         if s == 'FORWARD':
-            if threat > self._FRONT_SAFE:
+            if dist > self._obs_dist:
                 self._pub(self._fwd_spd, 0.0)
             else:
                 self.get_logger().warn(
-                    f'[AUTO] 장애물! 전방 위협 {threat:.1f}cm '
-                    f'(한계={self._FRONT_SAFE:.1f}cm) → 정지'
+                    f'[AUTO] 장애물 감지! dist={dist:.1f}cm → 정지'
                 )
                 self._pub(0.0, 0.0)
                 self._state       = 'STOP_BEFORE_TURN'
@@ -199,10 +139,10 @@ class AvoidanceNode(Node):
                 self._state       = 'RECHECK'
                 self._state_start = now
 
-        # ── RECHECK (0.15s 대기 후 재확인) ───────────────────────
+        # ── RECHECK (0.1s 대기 후 재확인) ────────────────────────
         elif s == 'RECHECK':
-            if now - self._state_start >= 0.15:
-                if threat > self._FRONT_SAFE:
+            if now - self._state_start >= 0.1:
+                if dist > self._obs_dist:
                     self.get_logger().info('[AUTO] 경로 확보 → 전진 재개')
                     self._state = 'FORWARD'
                 else:
