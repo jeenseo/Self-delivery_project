@@ -1,29 +1,9 @@
-"""
-robot.launch.py
-===============
-ROS 2 런치 파일: 4개 노드를 한 번에 시작
-
-사용법:
-  ros2 launch robot_controller robot.launch.py
-
-노드 시작 순서:
-  1. lidar_node     — RPLIDAR 스캔 (/scan, /forward_distance)
-  2. motor_node     — CAN 모터 제어 (/cmd_vel → CAN TX)
-  3. avoidance_node — AUTO 장애물 회피 (/forward_distance → /cmd_vel)
-  4. keyboard_node  — 수동 키보드 제어 (/cmd_vel, /mode)
-
-파라미터 오버라이드 예시:
-  ros2 launch robot_controller robot.launch.py fov_degrees:=120.0
-"""
-
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-
 def generate_launch_description():
-
     # ── Launch 인수 선언 (커맨드라인에서 오버라이드 가능) ───────
     fov_arg = DeclareLaunchArgument(
         'fov_degrees', default_value='60.0',
@@ -53,9 +33,9 @@ def generate_launch_description():
         name='lidar_node',
         output='screen',
         parameters=[{
-            'port':         '/dev/ttyUSB0',
-            'baud':         115200,
-            'fov_degrees':  LaunchConfiguration('fov_degrees'),
+            'port': '/dev/ttyUSB0',
+            'baud': 115200,
+            'fov_degrees': LaunchConfiguration('fov_degrees'),
             'lidar_offset': LaunchConfiguration('lidar_offset'),
         }],
     )
@@ -67,8 +47,8 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'can_channel': 'can0',
-            'can_id':      0x123,
-            'max_speed':   9999,
+            'can_id': 0x123,
+            'max_speed': 9999,
         }],
     )
 
@@ -78,23 +58,11 @@ def generate_launch_description():
         name='avoidance_node',
         output='screen',
         parameters=[{
-            'obstacle_dist_cm':  LaunchConfiguration('obstacle_dist_cm'),
-            'turn_10deg_sec':    LaunchConfiguration('turn_10deg_sec'),
+            'obstacle_dist_cm': LaunchConfiguration('obstacle_dist_cm'),
+            'turn_10deg_sec': LaunchConfiguration('turn_10deg_sec'),
             'backward_10cm_sec': LaunchConfiguration('backward_10cm_sec'),
-            'forward_speed':     0.2002,
-            'turn_speed':        0.2002,
-        }],
-    )
-
-    keyboard_node = Node(
-        package='robot_controller',
-        executable='keyboard_node',
-        name='keyboard_node',
-        output='screen',
-        prefix='xterm -e',    # 별도 터미널 창에서 실행 (키보드 입력 분리)
-        parameters=[{
             'forward_speed': 0.2002,
-            'turn_speed':    0.2002,
+            'turn_speed': 0.2002,
         }],
     )
 
@@ -106,6 +74,5 @@ def generate_launch_description():
         back_sec_arg,
         lidar_node,
         motor_node,
-        avoidance_node,
-        keyboard_node,
+        avoidance_node
     ])
