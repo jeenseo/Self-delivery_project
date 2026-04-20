@@ -1,0 +1,26 @@
+# STM32 빌드 결과물 (가장 큰 충돌 원인)
+Debug/
+Release/
+*.elf
+*.list
+*.map
+*.o
+*.d
+*.su
+*.cyclo
+*.launch
+
+# STM32CubeIDE/Eclipse 설정 파일
+.settings/
+.project
+.cproject
+.mxproject
+
+# 윈도우 시스템 찌꺼기
+desktop.ini
+Thumbs.db
+
+# ROS 2 빌드 및 로그
+install/
+build/
+log/

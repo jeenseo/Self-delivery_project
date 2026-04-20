@@ -1,3 +1,0 @@
-../Core/Src/motor.c:52:13:_set_wheel	9
-../Core/Src/motor.c:97:6:Motor_Drive	1
-../Core/Src/motor.c:130:6:Motor_Stop	1
