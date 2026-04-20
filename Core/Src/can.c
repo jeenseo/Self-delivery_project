@@ -11,15 +11,12 @@
   *
   *  비트레이트 계산:
   *    PCLK1 = 36 MHz,  Prescaler = 6  → TQ clock = 6 MHz
-  *    1 + BS1(9) + BS2(2) = 12 TQ  → 6 MHz / 12 = 500 kbps ✓
-  *    Sample Point = (1+9)/12 × 100 = 83.3 %
+  *    1 + BS1(10) + BS2(1) = 12 TQ  → 6 MHz / 12 = 500 kbps ✓
   ******************************************************************************
   */
 /* USER CODE END Header */
-
 /* Includes ------------------------------------------------------------------*/
 #include "can.h"
-#include "motor.h"
 
 /* USER CODE BEGIN 0 */
 
@@ -31,12 +28,12 @@ CAN_HandleTypeDef   hcan;
 CAN_RxHeaderTypeDef rxHeader;
 uint8_t             rxData[8];
 
-uint8_t             dataReceived = 0;        /* CAN 수신 플래그 (main 루프용) */
-int16_t             rxLeftSpeed  = 0;        /* 수신 좌측 속도 (-9999 ~ +9999) */
-int16_t             rxRightSpeed = 0;        /* 수신 우측 속도 (-9999 ~ +9999) */
+uint8_t             dataReceived = 0;   /* CAN 수신 플래그 (main 루프용) */
+int16_t             rxLeftSpeed  = 0;   /* 수신 좌측 속도 (-9999 ~ +9999) */
+int16_t             rxRightSpeed = 0;   /* 수신 우측 속도 (-9999 ~ +9999) */
 
 /* ── CAN_filter ─────────────────────────────────────────────────────────────
- *   Pass-All 필터: 모든 CAN ID 수신 허용 (테스트용)
+ *   Pass-All 필터: 모든 CAN ID 수신 허용
  * ──────────────────────────────────────────────────────────────────────── */
 void CAN_filter(void)
 {
@@ -58,7 +55,7 @@ void CAN_filter(void)
 }
 
 /* ── HAL_CAN_RxFifo0MsgPendingCallback ─────────────────────────────────────
- *   ISR 내부: 데이터 파싱 + 플래그 세팅만 수행 (printf/UART 금지)
+ *   ISR 내부: 데이터 파싱 + 플래그 세팅만 (printf/UART 금지)
  *   main 루프에서 dataReceived 확인 후 Motor_Drive 호출
  * ──────────────────────────────────────────────────────────────────────── */
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan_ptr)
@@ -70,19 +67,19 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan_ptr)
         /* Byte 2~3: Right Speed (Big-Endian int16_t) */
         rxRightSpeed = (int16_t)((rxData[2] << 8) | rxData[3]);
 
-        /* main 루프에 처리 요청 */
         dataReceived = 1;
     }
 }
 
 /* ── MX_CAN_Init ──────────────────────────────────────────────────────────
  *   CAN1 500 kbps 초기화
- *   PCLK1=36MHz / Prescaler=6 / BS1=9TQ / BS2=2TQ → 500kbps
+ *   PCLK1=36MHz / Prescaler=6 / BS1=10TQ / BS2=1TQ → 500kbps
  * ──────────────────────────────────────────────────────────────────────── */
 void MX_CAN_Init(void)
 {
     /* USER CODE BEGIN CAN_Init 0 */
     /* USER CODE END CAN_Init 0 */
+
     /* USER CODE BEGIN CAN_Init 1 */
     /* USER CODE END CAN_Init 1 */
 
@@ -90,8 +87,8 @@ void MX_CAN_Init(void)
     hcan.Init.Prescaler            = 6;
     hcan.Init.Mode                 = CAN_MODE_NORMAL;
     hcan.Init.SyncJumpWidth        = CAN_SJW_1TQ;
-    hcan.Init.TimeSeg1             = CAN_BS1_9TQ;   /* 500 kbps */
-    hcan.Init.TimeSeg2             = CAN_BS2_2TQ;   /* 500 kbps */
+    hcan.Init.TimeSeg1             = CAN_BS1_10TQ;
+    hcan.Init.TimeSeg2             = CAN_BS2_1TQ;
     hcan.Init.TimeTriggeredMode    = DISABLE;
     hcan.Init.AutoBusOff           = DISABLE;
     hcan.Init.AutoWakeUp           = DISABLE;
@@ -106,52 +103,45 @@ void MX_CAN_Init(void)
     /* USER CODE END CAN_Init 2 */
 }
 
-/* ── HAL_CAN_MspInit ─────────────────────────────────────────────────────
- *   PA11 → CAN_RX (Input Floating)
- *   PA12 → CAN_TX (AF Push-Pull)
- *   IRQ  : USB_LP_CAN1_RX0_IRQn 만 활성화
- * ──────────────────────────────────────────────────────────────────────── */
-void HAL_CAN_MspInit(CAN_HandleTypeDef *canHandle)
+void HAL_CAN_MspInit(CAN_HandleTypeDef* canHandle)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-    if (canHandle->Instance == CAN1)
+    if(canHandle->Instance==CAN1)
     {
         /* USER CODE BEGIN CAN1_MspInit 0 */
         /* USER CODE END CAN1_MspInit 0 */
-
         __HAL_RCC_CAN1_CLK_ENABLE();
         __HAL_RCC_GPIOA_CLK_ENABLE();
 
+        /* PA11 → CAN_RX */
         GPIO_InitStruct.Pin  = GPIO_PIN_11;
         GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
         GPIO_InitStruct.Pull = GPIO_NOPULL;
         HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+        /* PA12 → CAN_TX */
         GPIO_InitStruct.Pin   = GPIO_PIN_12;
         GPIO_InitStruct.Mode  = GPIO_MODE_AF_PP;
         GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
         HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+        /* RX FIFO0 인터럽트 활성화 */
         HAL_NVIC_SetPriority(USB_LP_CAN1_RX0_IRQn, 0, 0);
         HAL_NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
-
         /* USER CODE BEGIN CAN1_MspInit 1 */
         /* USER CODE END CAN1_MspInit 1 */
     }
 }
 
-void HAL_CAN_MspDeInit(CAN_HandleTypeDef *canHandle)
+void HAL_CAN_MspDeInit(CAN_HandleTypeDef* canHandle)
 {
-    if (canHandle->Instance == CAN1)
+    if(canHandle->Instance==CAN1)
     {
         /* USER CODE BEGIN CAN1_MspDeInit 0 */
         /* USER CODE END CAN1_MspDeInit 0 */
-
         __HAL_RCC_CAN1_CLK_DISABLE();
-        HAL_GPIO_DeInit(GPIOA, GPIO_PIN_11 | GPIO_PIN_12);
+        HAL_GPIO_DeInit(GPIOA, GPIO_PIN_11|GPIO_PIN_12);
         HAL_NVIC_DisableIRQ(USB_LP_CAN1_RX0_IRQn);
-
         /* USER CODE BEGIN CAN1_MspDeInit 1 */
         /* USER CODE END CAN1_MspDeInit 1 */
     }
