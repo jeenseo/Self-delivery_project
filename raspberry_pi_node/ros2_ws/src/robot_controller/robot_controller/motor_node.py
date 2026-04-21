@@ -1,21 +1,29 @@
 """
 motor_node.py
 =============
-ROS 2 Node: /cmd_vel → CAN 4-바이트 모터 명령 변환기
+ROS 2 Node: /cmd_vel → CAN 8-바이트 4-휠 독립 모터 명령 변환기
 
-토픽 입력:
-  /cmd_vel  (geometry_msgs/Twist)
-    linear.x  : [-1.0, +1.0]  전진(+) / 후진(-)
-    angular.z : [-1.0, +1.0]  좌회전(+) / 우회전(-)
+CAN 출력 프로토콜 (ID 0x123, 8바이트):
+  Byte 0-1 : int16_t FL (Front Left)   Big-Endian
+  Byte 2-3 : int16_t FR (Front Right)  Big-Endian
+  Byte 4-5 : int16_t RL (Rear Left)    Big-Endian
+  Byte 6-7 : int16_t RR (Rear Right)   Big-Endian
 
-CAN 출력:
-  ID    : 0x123 (11-bit 표준)
-  Byte 0-1 : int16_t Left  Motor Speed  Big-Endian  (-9999 ~ +9999)
-  Byte 2-3 : int16_t Right Motor Speed  Big-Endian  (-9999 ~ +9999)
+믹싱 규약:
+  Twist 입력: linear.x ∈ [-1,+1], angular.z ∈ [-1,+1]
 
-스키드-스티어 믹싱:
-  left  = (linear - angular) × max_speed
-  right = (linear + angular) × max_speed
+  linear_v  = linear.x  × max_speed
+  angular_v = angular.z × max_speed
+
+  FL = clamp(linear_v + angular_v)   ← 전진 + 좌회전
+  FR = clamp(linear_v - angular_v)   ← 전진 - 좌회전
+
+  MANUAL 모드 (100% 전/후륜 동일):
+    RL = FL,  RR = FR
+
+  AUTO 모드 (후륜 angular 30% — mechanical binding 방지):
+    RL = clamp(linear_v + angular_v × 0.3)
+    RR = clamp(angular_v × 0.3 - linear_v)   ← STM32에서 -rr 반전 보정
 
 파라미터:
   can_channel  str  'can0'
@@ -24,10 +32,12 @@ CAN 출력:
 """
 
 import struct
+import threading
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from std_msgs.msg import String
 
 import can
 
@@ -46,49 +56,84 @@ class MotorNode(Node):
         self._can_id    = self.get_parameter('can_id').value
         self._max_speed = self.get_parameter('max_speed').value
 
+        # ── 모드 상태 ─────────────────────────────────────────────
+        self._mode      = 'MANUAL'   # 'MANUAL' | 'AUTO'
+        self._mode_lock = threading.Lock()
+
         # ── CAN 버스 초기화 ───────────────────────────────────────
         try:
             self._bus = can.interface.Bus(channel=channel, bustype='socketcan')
-            self.get_logger().info(f'CAN 버스 초기화 완료 ({channel}, ID=0x{self._can_id:03X})')
+            self.get_logger().info(
+                f'CAN 버스 초기화 완료 ({channel}, ID=0x{self._can_id:03X})'
+            )
         except Exception as exc:
             self.get_logger().fatal(f'CAN 버스 초기화 실패: {exc}')
             raise
 
-        # ── /cmd_vel 구독 ─────────────────────────────────────────
-        self._sub = self.create_subscription(
+        # ── 구독 ─────────────────────────────────────────────────
+        self._sub_cmd  = self.create_subscription(
             Twist, '/cmd_vel', self._cmd_vel_cb, 10
         )
-        self.get_logger().info('MotorNode 준비 완료')
+        self._sub_mode = self.create_subscription(
+            String, '/mode', self._mode_cb, 10
+        )
+        self.get_logger().info('MotorNode 준비 완료 (8바이트 CAN 프로토콜)')
+
+    # ── /mode 콜백 ────────────────────────────────────────────────
+    def _mode_cb(self, msg: String) -> None:
+        with self._mode_lock:
+            old         = self._mode
+            self._mode  = msg.data
+        if old != msg.data:
+            self.get_logger().info(f'[MODE] {old} → {msg.data}')
 
     # ── /cmd_vel 콜백 ─────────────────────────────────────────────
     def _cmd_vel_cb(self, msg: Twist) -> None:
         """
-        Twist → 수정된 스키드-스티어 믹싱 후 CAN 전송.
+        Twist → 4-휠 속도 계산 후 8바이트 CAN 전송.
 
-        물리 역분석 결과 (Up→전진, Left→좌회전 보장):
-          Physical v = k*(L-R),  Physical ω = k*(L+R)
-          역산:
-            left  = (linear + angular) × max_speed
-            right = (angular − linear) × max_speed
-
-          Up   (linear=+1, ω=0) → L=+N, R=-N → 물리 전진 ✓
-          Left (ω=+1, v=0)      → L=+N, R=+N → 물리 좌회전 ✓
+        MANUAL: 전/후륜 동일 (100% 토크, 최대 제어력)
+        AUTO  : 후륜 angular 30% (급선회 시 기계적 binding 방지)
         """
         linear  = max(-1.0, min(1.0, float(msg.linear.x)))
         angular = max(-1.0, min(1.0, float(msg.angular.z)))
 
-        left  = int((linear + angular) * self._max_speed)
-        right = int((angular - linear) * self._max_speed)
-        left  = max(-self._max_speed, min(self._max_speed, left))
-        right = max(-self._max_speed, min(self._max_speed, right))
+        linear_v  = linear  * self._max_speed
+        angular_v = angular * self._max_speed
 
-        self._send_can(left, right)
-        self.get_logger().debug(f'[CAN TX] L={left:+6d}  R={right:+6d}')
+        # ── 전륜: 100% 차동 ───────────────────────────────────────
+        fl = int(linear_v + angular_v)
+        fr = int(linear_v - angular_v)
+
+        # ── 후륜: 모드에 따라 계산 ────────────────────────────────
+        with self._mode_lock:
+            mode = self._mode
+
+        if mode == 'MANUAL':
+            # MANUAL: 전/후륜 동일 (100%)
+            rl = fl
+            rr = fr
+        else:
+            # AUTO: 후륜 angular 30% (binding 방지)
+            rl = int(linear_v + angular_v * 0.3)
+            rr = int(angular_v * 0.3 - linear_v)  # STM32에서 -rr 반전
+
+        # ── 클램프 ───────────────────────────────────────────────
+        N  = self._max_speed
+        fl = max(-N, min(N, fl))
+        fr = max(-N, min(N, fr))
+        rl = max(-N, min(N, rl))
+        rr = max(-N, min(N, rr))
+
+        self._send_can(fl, fr, rl, rr)
+        self.get_logger().debug(
+            f'[CAN TX] FL={fl:+6d} FR={fr:+6d} RL={rl:+6d} RR={rr:+6d}'
+        )
 
     # ── CAN 전송 ──────────────────────────────────────────────────
-    def _send_can(self, left: int, right: int) -> None:
-        """4-바이트 Big-Endian CAN 프레임 전송."""
-        data = struct.pack('>hh', left, right)
+    def _send_can(self, fl: int, fr: int, rl: int, rr: int) -> None:
+        """8-바이트 Big-Endian CAN 프레임 전송."""
+        data = struct.pack('>hhhh', fl, fr, rl, rr)
         msg  = can.Message(
             arbitration_id=self._can_id,
             data=data,
@@ -102,7 +147,7 @@ class MotorNode(Node):
     # ── 노드 소멸 ─────────────────────────────────────────────────
     def destroy_node(self):
         try:
-            self._send_can(0, 0)   # 긴급 정지
+            self._send_can(0, 0, 0, 0)   # 긴급 정지
             self._bus.shutdown()
         except Exception:
             pass

@@ -19,8 +19,10 @@ extern "C" {
 /* Exported variables --------------------------------------------------------*/
 extern CAN_HandleTypeDef hcan;
 extern uint8_t           dataReceived;   /* CAN 수신 플래그                    */
-extern int16_t           rxLeftSpeed;    /* 수신 좌측 속도 (-9999 ~ +9999)      */
-extern int16_t           rxRightSpeed;   /* 수신 우측 속도 (-9999 ~ +9999)      */
+extern int16_t           rxFL;           /* Front Left  (-9999 ~ +9999)        */
+extern int16_t           rxFR;           /* Front Right (-9999 ~ +9999)        */
+extern int16_t           rxRL;           /* Rear Left   (-9999 ~ +9999)        */
+extern int16_t           rxRR;           /* Rear Right  (-9999 ~ +9999)        */
 
 /* USER CODE BEGIN Includes */
 /* USER CODE END Includes */

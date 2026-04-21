@@ -18,13 +18,20 @@
  *  우측 후륜 │ PC1           │ htim2 TIM2_CH2    │ PA1
  * ─────────────────────────────────────────────────────────────────
  *
- * 전륜 우선 스티어링 (Front-Wheel Bias):
- *   전륜 (htim1): 좌/우 완전 차동 (left / right 원값)
- *   후륜 (htim2): 직진 성분(base) + 차동 30% — 후방 항력(drag) 방지
+ * 하드웨어 특성:
+ *   전륜 (htim1): 양수 값 = 전진
+ *   후륜 (htim2): 하드웨어 역결선 → 음수 값 적용해야 전진
+ *                Motor_Drive 내부에서 -rl, -rr 적용
  *
- * Motor_Drive(left, right):
- *   양수 = 전진, 음수 = 후진, 0 = 정지
- *   유효 범위: -9999 ~ +9999
+ * CAN 프로토콜 (Pi → STM32, 8바이트):
+ *   Byte 0-1: FL (Front Left)
+ *   Byte 2-3: FR (Front Right)
+ *   Byte 4-5: RL (Rear Left)
+ *   Byte 6-7: RR (Rear Right)
+ *
+ * Motor_Drive(fl, fr, rl, rr):
+ *   양수 = 전진 의도, 음수 = 후진 의도
+ *   범위: -9999 ~ +9999
  */
 
 #include "motor.h"
@@ -32,10 +39,6 @@
 
 /* ── 상수 ────────────────────────────────────────────────── */
 #define MOTOR_PWM_MAX    9999
-
-/* 후륜 차동 비율 (30%) */
-#define REAR_BIAS_NUM    3
-#define REAR_BIAS_DEN    10
 
 /* ── 내부 헬퍼: Sign-Magnitude 단일 채널 설정 ──────────────
  *
@@ -86,40 +89,25 @@ static void _set_wheel(
 /**
  * Motor_Drive
  * ──────────────────────────────────────────────────────────
- * 전륜 우선 스키드-스티어 구동.
+ * 4-휠 독립 제어. CAN 수신값을 직접 각 채널에 적용.
  *
- * @param left   좌측 CAN 속도값 (-9999 ~ +9999)
- * @param right  우측 CAN 속도값 (-9999 ~ +9999)
+ * @param fl  Front Left  속도 (-9999 ~ +9999, 양수=전진)
+ * @param fr  Front Right 속도
+ * @param rl  Rear Left   속도 (하드웨어 반전: 내부에서 -rl 적용)
+ * @param rr  Rear Right  속도 (하드웨어 반전: 내부에서 -rr 적용)
  *
- * 전륜 (htim1): 완전 차동 (left, right 그대로)
- * 후륜 (htim2): 직진 성분 + 차동 30% (후방 항력 방지)
+ * 전륜 (htim1): 값 그대로 적용
+ * 후륜 (htim2): 역결선 보정 — (-) 부호 반전 후 적용
  */
-void Motor_Drive(int16_t left, int16_t right)
+void Motor_Drive(int16_t fl, int16_t fr, int16_t rl, int16_t rr)
 {
-    /* ── 전륜 속도 계산: 완전 차동 ──────────────────────── */
-    int16_t L_front = left;
-    int16_t R_front = right;
+    /* 전륜: DIR=PC2/PC3, PWM=PA8/PA9 (htim1) — 값 그대로 */
+    _set_wheel(GPIO_PIN_2, &htim1, TIM_CHANNEL_1,  fl);   /* L Front */
+    _set_wheel(GPIO_PIN_3, &htim1, TIM_CHANNEL_2,  fr);   /* R Front */
 
-    /* ── 후륜 속도 계산: 직진 성분(base) + 30% 차동 ─────── */
-    int16_t base   = (int16_t)((left + right) / 2);
-    int16_t diff_L = (int16_t)((left  - base) * REAR_BIAS_NUM / REAR_BIAS_DEN);
-    int16_t diff_R = (int16_t)((right - base) * REAR_BIAS_NUM / REAR_BIAS_DEN);
-    int16_t L_rear = (int16_t)(base + diff_L);
-    int16_t R_rear = (int16_t)(base + diff_R);
-
-    /* ── 4채널 개별 적용 ─────────────────────────────────── */
-
-    /* 좌측 전륜: DIR=PC2, PWM=PA8 (htim1 TIM1_CH1) */
-    _set_wheel(GPIO_PIN_2, &htim1, TIM_CHANNEL_1, L_front);
-
-    /* 우측 전륜: DIR=PC3, PWM=PA9 (htim1 TIM1_CH2) */
-    _set_wheel(GPIO_PIN_3, &htim1, TIM_CHANNEL_2, R_front);
-
-    /* 좌측 후륜: DIR=PC0, PWM=PA0 (htim2 TIM2_CH1) */
-    _set_wheel(GPIO_PIN_0, &htim2, TIM_CHANNEL_1, L_rear);
-
-    /* 우측 후륜: DIR=PC1, PWM=PA1 (htim2 TIM2_CH2) */
-    _set_wheel(GPIO_PIN_1, &htim2, TIM_CHANNEL_2, R_rear);
+    /* 후륜: DIR=PC0/PC1, PWM=PA0/PA1 (htim2) — 하드웨어 반전 보정 */
+    _set_wheel(GPIO_PIN_0, &htim2, TIM_CHANNEL_1, -rl);   /* L Rear  */
+    _set_wheel(GPIO_PIN_1, &htim2, TIM_CHANNEL_2, -rr);   /* R Rear  */
 }
 
 /**
@@ -129,5 +117,5 @@ void Motor_Drive(int16_t left, int16_t right)
  */
 void Motor_Stop(void)
 {
-    Motor_Drive(0, 0);
+    Motor_Drive(0, 0, 0, 0);
 }

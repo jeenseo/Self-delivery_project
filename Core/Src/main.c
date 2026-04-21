@@ -47,8 +47,10 @@
 
 /* USER CODE BEGIN PV */
 extern uint8_t dataReceived;    /* can.c에 정의 */
-extern int16_t rxLeftSpeed;     /* can.c에 정의 */
-extern int16_t rxRightSpeed;    /* can.c에 정의 */
+extern int16_t rxFL;            /* can.c에 정의: Front Left  */
+extern int16_t rxFR;            /* can.c에 정의: Front Right */
+extern int16_t rxRL;            /* can.c에 정의: Rear Left   */
+extern int16_t rxRR;            /* can.c에 정의: Rear Right  */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -128,9 +130,9 @@ int main(void)
     if (dataReceived == 1)
     {
       /* 콘솔 출력 후 모터 구동 */
-      printf("[CAN RX] ID:0x123 | L=%+6d  R=%+6d\r\n",
-             (int)rxLeftSpeed, (int)rxRightSpeed);
-      Motor_Drive(rxLeftSpeed, rxRightSpeed);
+      printf("[CAN RX] FL=%+6d FR=%+6d RL=%+6d RR=%+6d\r\n",
+             (int)rxFL, (int)rxFR, (int)rxRL, (int)rxRR);
+      Motor_Drive(rxFL, rxFR, rxRL, rxRR);
       dataReceived = 0;
     }
   }

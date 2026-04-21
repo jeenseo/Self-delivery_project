@@ -29,8 +29,10 @@ CAN_RxHeaderTypeDef rxHeader;
 uint8_t             rxData[8];
 
 uint8_t             dataReceived = 0;   /* CAN 수신 플래그 (main 루프용) */
-int16_t             rxLeftSpeed  = 0;   /* 수신 좌측 속도 (-9999 ~ +9999) */
-int16_t             rxRightSpeed = 0;   /* 수신 우측 속도 (-9999 ~ +9999) */
+int16_t             rxFL = 0;           /* Front Left  (-9999 ~ +9999)   */
+int16_t             rxFR = 0;           /* Front Right (-9999 ~ +9999)   */
+int16_t             rxRL = 0;           /* Rear Left   (-9999 ~ +9999)   */
+int16_t             rxRR = 0;           /* Rear Right  (-9999 ~ +9999)   */
 
 /* ── CAN_filter ─────────────────────────────────────────────────────────────
  *   Pass-All 필터: 모든 CAN ID 수신 허용
@@ -62,10 +64,14 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan_ptr)
 {
     if (HAL_CAN_GetRxMessage(hcan_ptr, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)
     {
-        /* Byte 0~1: Left Speed  (Big-Endian int16_t) */
-        rxLeftSpeed  = (int16_t)((rxData[0] << 8) | rxData[1]);
-        /* Byte 2~3: Right Speed (Big-Endian int16_t) */
-        rxRightSpeed = (int16_t)((rxData[2] << 8) | rxData[3]);
+        /* Byte 0~1: Front Left  (Big-Endian int16_t) */
+        rxFL = (int16_t)((rxData[0] << 8) | rxData[1]);
+        /* Byte 2~3: Front Right (Big-Endian int16_t) */
+        rxFR = (int16_t)((rxData[2] << 8) | rxData[3]);
+        /* Byte 4~5: Rear Left   (Big-Endian int16_t) */
+        rxRL = (int16_t)((rxData[4] << 8) | rxData[5]);
+        /* Byte 6~7: Rear Right  (Big-Endian int16_t) */
+        rxRR = (int16_t)((rxData[6] << 8) | rxData[7]);
 
         dataReceived = 1;
     }
