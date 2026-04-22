@@ -27,16 +27,32 @@ def generate_launch_description():
     )
 
     # ── 노드 정의 ─────────────────────────────────────────────
+    
+    # [수정됨] 기존 커스텀 lidar_node는 주석 처리하여 비활성화합니다.
+    # lidar_node = Node(
+    #     package='robot_controller',
+    #     executable='lidar_node',
+    #     name='lidar_node',
+    #     output='screen',
+    #     parameters=[{
+    #         'port': '/dev/ttyUSB0',
+    #         'baud': 115200,
+    #         'fov_degrees': LaunchConfiguration('fov_degrees'),
+    #         'lidar_offset': LaunchConfiguration('lidar_offset'),
+    #     }],
+    # )
+
+    # [추가됨] 공식 rplidar_ros 패키지의 안정적인 노드로 교체
     lidar_node = Node(
-        package='robot_controller',
-        executable='lidar_node',
-        name='lidar_node',
+        package='rplidar_ros',
+        executable='rplidar_composition',
+        name='rplidar_node',
         output='screen',
         parameters=[{
-            'port': '/dev/ttyUSB0',
-            'baud': 115200,
-            'fov_degrees': LaunchConfiguration('fov_degrees'),
-            'lidar_offset': LaunchConfiguration('lidar_offset'),
+            'serial_port': '/dev/rplidar',
+            'frame_id': 'laser_frame',
+            'angle_compensate': True,
+            'scan_mode': 'Express'  # 터미널에서 확인된 최적 모드
         }],
     )
 
@@ -76,3 +92,4 @@ def generate_launch_description():
         motor_node,
         avoidance_node
     ])
+    

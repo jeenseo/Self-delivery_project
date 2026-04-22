@@ -3,39 +3,10 @@ avoidance_node.py
 =================
 ROS 2 Node: 장애물 회피 자율 주행 (AUTO 모드)
 
-비대칭 바운딩박스 기반 위협 감지:
-  LiDAR 중심 (0,0) 기준:
-    전방: 6.5 cm  + 40 cm 마진 = 46.5 cm
-    좌측: 17.0 cm + 40 cm 마진 = 57.0 cm
-    우측: 17.5 cm + 40 cm 마진 = 57.5 cm
-
-위협 판정 알고리즘:
-  각 LiDAR 점 → 직교좌표 변환:
-    x = dist * cos(angle)   [전방 +]
-    y = dist * sin(angle)   [좌측 +]
-  전방 코리더 조건: x > 0  AND  -RIGHT_SAFE ≤ y ≤ LEFT_SAFE
-  코리더 내 최소 x ≤ FRONT_SAFE → 회피 발동
-
-토픽 입력:
-  /scan   (sensor_msgs/LaserScan) — 원시 스캔
-  /mode   (std_msgs/String)       — "MANUAL" | "AUTO"
-
-토픽 출력:
-  /cmd_vel (geometry_msgs/Twist)  — AUTO 모드일 때만 게시
-
-상태머신 (10Hz 타이머):
-  FORWARD → STOP_BEFORE_TURN → TURN_LEFT_1 → RECHECK
-         → (막힘) BACKWARD → TURN_LEFT_2 → FORWARD
-
-파라미터:
-  front_body_cm      float  6.5    차체 전방 돌출 (LiDAR 기준)
-  left_body_cm       float  17.0   차체 좌측 폭
-  right_body_cm      float  17.5   차체 우측 폭
-  safety_margin_cm   float  40.0   전방향 안전 마진
-  turn_10deg_sec     float  0.2
-  backward_10cm_sec  float  0.5
-  forward_speed      float  0.2002 (= 2000/9999)
-  turn_speed         float  0.2002
+수정 사항:
+1. rclpy.qos.qos_profile_sensor_data 적용 (LiDAR 데이터 수신 불가 해결)
+2. lidar_offset 파라미터 추가 및 수식 적용 (앞/뒤 180도 착각 문제 해결)
+3. math.isinf, math.isnan 예외 처리 추가 (안정성 강화)
 """
 
 import math
@@ -48,6 +19,8 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
+# [수정 1] 센서 데이터를 받기 위한 필수 QoS 라이브러리 추가
+from rclpy.qos import qos_profile_sensor_data
 
 class AvoidanceNode(Node):
 
@@ -63,6 +36,8 @@ class AvoidanceNode(Node):
         self.declare_parameter('backward_10cm_sec', 0.5)
         self.declare_parameter('forward_speed',     0.2002)
         self.declare_parameter('turn_speed',        0.2002)
+        # [수정 2] 런치 파일에서 전달하는 lidar_offset 파라미터 선언
+        self.declare_parameter('lidar_offset',      0.0)
 
         margin = self.get_parameter('safety_margin_cm').value
 
@@ -75,6 +50,9 @@ class AvoidanceNode(Node):
         self._back_sec = self.get_parameter('backward_10cm_sec').value
         self._fwd_spd  = self.get_parameter('forward_speed').value
         self._trn_spd  = self.get_parameter('turn_speed').value
+        
+        # 라이다 조립 방향 보정값 (라디안 변환)
+        self._lidar_offset_rad = math.radians(self.get_parameter('lidar_offset').value)
 
         self.get_logger().info(
             f'바운딩박스 안전 구역: '
@@ -94,10 +72,12 @@ class AvoidanceNode(Node):
 
         # ── 토픽 게시자 / 구독자 ──────────────────────────────────
         self._cmd_pub  = self.create_publisher(Twist, '/cmd_vel', 10)
-
+        
+        # [수정 1] QoS 프로필을 qos_profile_sensor_data로 변경
         self._sub_scan = self.create_subscription(
-            LaserScan, '/scan', self._scan_cb, 10
+            LaserScan, '/scan', self._scan_cb, qos_profile_sensor_data
         )
+        
         self._sub_mode = self.create_subscription(
             String, '/mode', self._mode_cb, 10
         )
@@ -105,23 +85,22 @@ class AvoidanceNode(Node):
         # ── 10Hz 상태머신 타이머 ──────────────────────────────────
         self._timer = self.create_timer(0.1, self._tick)
 
-        self.get_logger().info('AvoidanceNode 준비 완료 (비대칭 바운딩박스, 10Hz)')
+        self.get_logger().info('AvoidanceNode 준비 완료 (QoS 및 Offset 패치 완료)')
 
     # ── LaserScan 콜백: 비대칭 바운딩박스 위협 판정 ──────────────
     def _scan_cb(self, msg: LaserScan) -> None:
-        """
-        각 LiDAR 점을 직교좌표로 변환 후
-        전방 코리더(-RIGHT_SAFE ≤ y ≤ LEFT_SAFE, x > 0) 내
-        최소 x 거리를 threat_dist 로 저장합니다.
-        """
         threat = float('inf')
 
         for i, r_m in enumerate(msg.ranges):
-            if r_m <= msg.range_min or r_m >= msg.range_max or r_m == 0.0:
+            # [수정 3] 무한대(inf)나 결측치(NaN) 필터링 강화
+            if math.isinf(r_m) or math.isnan(r_m) or r_m <= msg.range_min or r_m >= msg.range_max or r_m == 0.0:
                 continue
 
-            angle_rad = msg.angle_min + i * msg.angle_increment
+            # [수정 2] 라이다 각도에 오프셋(보정값) 추가
+            angle_rad = msg.angle_min + i * msg.angle_increment + self._lidar_offset_rad
+
             r_cm = r_m * 100.0
+
             x_cm = r_cm * math.cos(angle_rad)   # 전방 +
             y_cm = r_cm * math.sin(angle_rad)   # 좌측 +
 
@@ -211,7 +190,6 @@ class AvoidanceNode(Node):
                 self._pub(0.0, 0.0)
                 self.get_logger().info('[AUTO] 회피 완료 → 전진 재개')
                 self._state = 'FORWARD'
-
 
 def main(args=None):
     rclpy.init(args=args)
