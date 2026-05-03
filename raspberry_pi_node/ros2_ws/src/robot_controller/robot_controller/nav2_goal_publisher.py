@@ -43,8 +43,8 @@ except ImportError:
     _TF2_AVAILABLE = False
 
 
-GOAL_DISTANCE_M = 3.0   # 전방 목표 거리 (m)
-UPDATE_RATE_HZ  = 0.5   # 목표 갱신 주기 (0.5Hz = 2초마다)
+GOAL_DISTANCE_M = 3.0   # $전방 목표 거리 (m)
+UPDATE_RATE_HZ  = 0.5   # $목표 갱신 주기 (0.5Hz = 2초마다)
 
 
 class Nav2GoalPublisher(Node):

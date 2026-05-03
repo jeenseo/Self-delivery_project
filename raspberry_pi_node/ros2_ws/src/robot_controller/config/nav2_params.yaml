@@ -164,16 +164,16 @@ controller_server:
       debug_trajectory_details:            True
       min_vel_x:                           0.0
       min_vel_y:                           0.0
-      max_vel_x:                           0.22
+      max_vel_x:                           0.22 # $로봇 직진 최대 속도
       max_vel_y:                           0.0
-      max_vel_theta:                       1.0
+      max_vel_theta:                       1.0  # 로봇 회전 최대 회전 속도
       min_speed_xy:                        0.0
       max_speed_xy:                        0.22
       min_speed_theta:                     0.0
-      acc_lim_x:                           2.5
+      acc_lim_x:                           2.5 # 급출발 속도
       acc_lim_y:                           0.0
       acc_lim_theta:                       3.2
-      decel_lim_x:                         -2.5
+      decel_lim_x:                         -2.5 # 급정지 속도
       decel_lim_y:                         0.0
       decel_lim_theta:                     -3.2
       vx_samples:                          20
@@ -183,7 +183,7 @@ controller_server:
       linear_granularity:                  0.05
       angular_granularity:                 0.025
       transform_tolerance:                 0.3
-      xy_goal_tolerance:                   0.25
+      xy_goal_tolerance:                   0.25 # $목표 위치 허용 오차
       trans_stopped_velocity:              0.25
       short_circuit_trajectory_evaluation: True
       stateful:                            True
@@ -201,7 +201,7 @@ controller_server:
       RotateToGoal.lookahead_time:     -1.0
 
 # ─────────────────────────────────────────────────────────────────────────
-local_costmap:
+local_costmap: # $로봇 주변의 동적 장애물 감지 및 회피를 위한 로컬 코스트맵
   local_costmap:
     ros__parameters:
       use_sim_time:       false
@@ -213,13 +213,13 @@ local_costmap:
       width:              5
       height:             5
       resolution:         0.05
-      footprint: "[[0.265, 0.370], [0.265, -0.375], [-0.570, -0.375], [-0.570, 0.370]]"
-      footprint_padding:  0.0
+      footprint: "[[0.265, 0.370], [0.265, -0.375], [-0.570, -0.375], [-0.570, 0.370]]" # $로봇 직사각형 모서리 좌표
+      footprint_padding:  0.1 # $로봇 주변에 추가 안전 마진이 필요하면 여기에 추가
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin:             "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius:    0.55
+        cost_scaling_factor: 3.0 # $값이 높으면 운전이 과감해짐
+        inflation_radius:    0.55 # $로봇 반경 + 안전 마진
       voxel_layer:
         plugin:               "nav2_costmap_2d::VoxelLayer"
         enabled:              True
@@ -244,7 +244,7 @@ local_costmap:
       always_send_full_costmap: True
 
 # ─────────────────────────────────────────────────────────────────────────
-global_costmap:
+global_costmap: # $전역 코스트맵: 사전 빌드된 정적 맵 사용
   global_costmap:
     ros__parameters:
       use_sim_time:        false
@@ -254,8 +254,8 @@ global_costmap:
       robot_base_frame:    base_footprint
       # rolling_window 제거: 정적 맵 사용
       resolution:          0.05
-      footprint: "[[0.265, 0.370], [0.265, -0.375], [-0.570, -0.375], [-0.570, 0.370]]"
-      footprint_padding:   0.0
+      footprint: "[[0.265, 0.370], [0.265, -0.375], [-0.570, -0.375], [-0.570, 0.370]]" # $로봇 직사각형 모서리 좌표
+      footprint_padding:   0.1 # $로봇 주변에 추가 안전 마진이 필요하면 여기에 추가
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
         plugin:    "nav2_costmap_2d::StaticLayer"
@@ -278,8 +278,8 @@ global_costmap:
           obstacle_min_range:  0.0
       inflation_layer:
         plugin:              "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius:    0.55
+        cost_scaling_factor: 3.0 # $값이 높으면 운전이 과감해짐
+        inflation_radius:    0.55 # $로봇 반경 + 안전 마진
       always_send_full_costmap: True
 
 # ─────────────────────────────────────────────────────────────────────────
