@@ -8,7 +8,7 @@
 #   오도메트리: rf2o_laser_odometry (스캔 매칭, 엔코더 없음)
 #   맵: maps/map.yaml (사전 빌드된 정적 맵)
 #
-# 비대칭 Footprint (base_link = LiDAR 위치 기준, 단위 m):
+# 비대칭 Footprint (base_link = LiDAR 위치 기준, 단위임 m):
 #   전방: +0.265 m,  좌측: +0.370 m
 #   우측: -0.375 m,  후방: -0.570 m
 #
