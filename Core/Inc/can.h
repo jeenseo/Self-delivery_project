@@ -6,6 +6,7 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
+/* Define to prevent recursive inclusion -------------------------------------*/
 #ifndef __CAN_H__
 #define __CAN_H__
 
@@ -16,23 +17,15 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
-/* Exported variables --------------------------------------------------------*/
-extern CAN_HandleTypeDef hcan;
-extern uint8_t           dataReceived;   /* CAN 수신 플래그                    */
-extern int16_t           rxFL;           /* Front Left  (-9999 ~ +9999)        */
-extern int16_t           rxFR;           /* Front Right (-9999 ~ +9999)        */
-extern int16_t           rxRL;           /* Rear Left   (-9999 ~ +9999)        */
-extern int16_t           rxRR;           /* Rear Right  (-9999 ~ +9999)        */
-
 /* USER CODE BEGIN Includes */
 /* USER CODE END Includes */
+
+extern CAN_HandleTypeDef hcan;
 
 /* USER CODE BEGIN Private defines */
 /* USER CODE END Private defines */
 
-/* Exported functions --------------------------------------------------------*/
 void MX_CAN_Init(void);
-void CAN_filter(void);
 
 /* USER CODE BEGIN Prototypes */
 /* USER CODE END Prototypes */
@@ -42,3 +35,4 @@ void CAN_filter(void);
 #endif
 
 #endif /* __CAN_H__ */
+
