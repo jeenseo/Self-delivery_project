@@ -40,10 +40,10 @@ extern "C" {
  *   0 = 정상 (DIR HIGH=전진)
  *   1 = 반전 (DIR LOW=전진) — 물리적 역결선 바퀴에 사용
  * ───────────────────────────────────────────────────────────── */
-#define FL_DIR_INVERT           0   /**< 좌측 전륜 — 필요 시 1로 변경 */
+#define FL_DIR_INVERT           1   /**< 좌측 전륜 — 필요 시 1로 변경 */
 #define FR_DIR_INVERT           0   /**< 우측 전륜 — 필요 시 1로 변경 */
-#define RL_DIR_INVERT           0   /**< 좌측 후륜 — 필요 시 1로 변경 */
-#define RR_DIR_INVERT           0   /**< 우측 후륜 — 필요 시 1로 변경 */
+#define RL_DIR_INVERT           1   /**< 좌측 후륜 — 필요 시 1로 변경 */
+#define RR_DIR_INVERT           0  /**< 우측 후륜 — 필요 시 1로 변경 */
 
 /* ─────────────────────────────────────────────────────────────
  * PID 조정 파라미터 (Tunable PID Gains)

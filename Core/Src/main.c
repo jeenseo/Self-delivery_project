@@ -30,6 +30,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "motor.h"   /* PID 모터 제어 + CAN TX 피드백 */
+#include <stdio.h> /* 💡 printf 및 stdout 사용을 위해 추가 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,20 +48,21 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-extern uint8_t dataReceived;    /* can.c에 정의: CAN 수신 플래그 */
-extern int16_t rxFL;            /* can.c에 정의: Front Left  목표 속도 */
-extern int16_t rxFR;            /* can.c에 정의: Front Right 목표 속도 */
-extern int16_t rxRL;            /* can.c에 정의: Rear Left   목표 속도 */
-extern int16_t rxRR;            /* can.c에 정의: Rear Right  목표 속도 */
+uint8_t dataReceived = 0;
+int16_t rxFL = 0;
+int16_t rxFR = 0;
+int16_t rxRL = 0;
+int16_t rxRR = 0;
 
 /* 메인 루프 타이밍 변수 */
-static uint32_t last_pid_tick = 0;   /* PID 마지막 실행 시각 (ms) */
-static uint32_t last_fb_tick  = 0;   /* CAN TX 마지막 실행 시각 (ms) */
+static uint32_t last_pid_tick = 0; /* PID 마지막 실행 시각 (ms) */
+static uint32_t last_fb_tick = 0;  /* CAN TX 마지막 실행 시각 (ms) */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
+void CAN_filter(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -226,6 +228,46 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/* CAN 모든 메시지 통과 필터 */
+void CAN_filter(void)
+{
+  CAN_FilterTypeDef canFilterConfig;
+  canFilterConfig.FilterActivation = CAN_FILTER_ENABLE;
+  canFilterConfig.FilterBank = 0;
+  canFilterConfig.FilterMode = CAN_FILTERMODE_IDMASK;
+  canFilterConfig.FilterScale = CAN_FILTERSCALE_32BIT;
+  canFilterConfig.FilterIdHigh = 0x0000;
+  canFilterConfig.FilterIdLow = 0x0000;
+  canFilterConfig.FilterMaskIdHigh = 0x0000;
+  canFilterConfig.FilterMaskIdLow = 0x0000;
+  canFilterConfig.FilterFIFOAssignment = CAN_RX_FIFO0;
+
+  if (HAL_CAN_ConfigFilter(&hcan, &canFilterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* 라즈베리파이 CAN 데이터(0x123) 수신 콜백 함수 */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+  CAN_RxHeaderTypeDef rxHeader;
+  uint8_t rxData[8];
+
+  if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)
+  {
+    if (rxHeader.StdId == 0x123) /* Pi -> STM32 */
+    {
+      rxFL = (int16_t)((rxData[0] << 8) | rxData[1]);
+      rxFR = (int16_t)((rxData[2] << 8) | rxData[3]);
+      rxRL = (int16_t)((rxData[4] << 8) | rxData[5]);
+      rxRR = (int16_t)((rxData[6] << 8) | rxData[7]);
+      dataReceived = 1; /* 메인 루프에 수신 완료 알림 */
+    }
+  }
+}
+
 /* USER CODE END 4 */
 
 /**
