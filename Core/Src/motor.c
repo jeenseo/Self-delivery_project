@@ -166,16 +166,33 @@ static void _drive_side(PID_t             *pid,
     }
     else
     {
-        /* ── 피드포워드 + PID 보정 ────────────────────────── */
+        /* ── 피드포워드(비례 데드밴드) + PID 보정 ─────────── */
         float pid_correction = _pid_compute(pid, measured);
 
         /*
-         * 피드포워드: DEADBAND_PWM → 마찰 극복
-         *            + 속도 비례 PWM (선형 스케일)
-         * 방향은 target_rpm 부호로 결정
+         * [수정] 비례 데드밴드 (Proportional Deadband Ramp)
+         *
+         * 문제: 기존 코드는 target_rpm > 0 이면 항상 DEADBAND_PWM(2000)을
+         *       무조건 추가 → Nav2가 0.05 m/s 미속을 요청해도 실제 PWM=2424,
+         *       물리 속도 ≈ 0.25 m/s 급발진 발생.
+         *
+         * 수정: LOW_RPM_RAMP (최대 속도의 12% ≈ 18 RPM ≈ 0.11 m/s) 이하에서
+         *       데드밴드를 속도에 비례하여 0까지 부드럽게 감소.
+         *       → 미속 명령에 정확히 반응, 급발진 제거.
+         *
+         * 공식:
+         *   abs_rpm < LOW_RPM_RAMP:
+         *     ff = DEADBAND_PWM × (abs_rpm / LOW_RPM_RAMP) + abs_rpm × SCALE
+         *   abs_rpm >= LOW_RPM_RAMP:
+         *     ff = DEADBAND_PWM + abs_rpm × SCALE  (기존과 동일)
          */
-        float ff_magnitude  = (float)DEADBAND_PWM
-                              + fabsf(pid->target_rpm) * RPM_TO_PWM_SCALE;
+#define LOW_RPM_RAMP    (MOTOR_MAX_RPM * 0.12f)   /* ≈ 18 RPM ≈ 0.11 m/s */
+
+        float abs_rpm   = fabsf(pid->target_rpm);
+        float db_ratio  = (abs_rpm < LOW_RPM_RAMP) ? (abs_rpm / LOW_RPM_RAMP) : 1.0f;
+
+        float ff_magnitude  = (float)DEADBAND_PWM * db_ratio
+                              + abs_rpm * RPM_TO_PWM_SCALE;
         float ff_with_sign  = (pid->target_rpm > 0.0f) ? ff_magnitude : -ff_magnitude;
 
         /* 총 출력 = 피드포워드 + PID 보정 */
