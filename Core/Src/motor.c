@@ -166,33 +166,24 @@ static void _drive_side(PID_t             *pid,
     }
     else
     {
-        /* ── 피드포워드(비례 데드밴드) + PID 보정 ─────────── */
+        /* ── 피드포워드(상수 DEADBAND) + PID 보정 ──────────── */
         float pid_correction = _pid_compute(pid, measured);
 
         /*
-         * [수정] 비례 데드밴드 (Proportional Deadband Ramp)
+         * [복원] 상수 DEADBAND 피드포워드
          *
-         * 문제: 기존 코드는 target_rpm > 0 이면 항상 DEADBAND_PWM(2000)을
-         *       무조건 추가 → Nav2가 0.05 m/s 미속을 요청해도 실제 PWM=2424,
-         *       물리 속도 ≈ 0.25 m/s 급발진 발생.
+         * 이전의 "비례 데드밴드(soft-start)" 로직은 수학적으로 타당하지만,
+         * 물리적으로 Mecanum 스키드-스티어 로봇에서 치명적 문제 발생:
+         *   - 높은 정적 마찰 + 불균일 지면 접촉으로 인해
+         *     PWM < DEADBAND_PWM(2000) 구간에서 모터 스톨, 좌우 지터 발생
+         *   - DEADBAND_PWM(2000) ≈ 0.195 m/s가 실질적 물리 최소 속도
          *
-         * 수정: LOW_RPM_RAMP (최대 속도의 12% ≈ 18 RPM ≈ 0.11 m/s) 이하에서
-         *       데드밴드를 속도에 비례하여 0까지 부드럽게 감소.
-         *       → 미속 명령에 정확히 반응, 급발진 제거.
-         *
-         * 공식:
-         *   abs_rpm < LOW_RPM_RAMP:
-         *     ff = DEADBAND_PWM × (abs_rpm / LOW_RPM_RAMP) + abs_rpm × SCALE
-         *   abs_rpm >= LOW_RPM_RAMP:
-         *     ff = DEADBAND_PWM + abs_rpm × SCALE  (기존과 동일)
+         * 해결 전략: Nav2 파라미터(min_speed_xy=0.15 m/s)로 미속 명령 차단
+         *   → Nav2가 0.15 m/s 이상만 요청하므로 soft-start 불필요
+         *   → STM32는 항상 안정 구동 범위(≥DEADBAND_PWM)에서 동작
          */
-#define LOW_RPM_RAMP    (MOTOR_MAX_RPM * 0.12f)   /* ≈ 18 RPM ≈ 0.11 m/s */
-
-        float abs_rpm   = fabsf(pid->target_rpm);
-        float db_ratio  = (abs_rpm < LOW_RPM_RAMP) ? (abs_rpm / LOW_RPM_RAMP) : 1.0f;
-
-        float ff_magnitude  = (float)DEADBAND_PWM * db_ratio
-                              + abs_rpm * RPM_TO_PWM_SCALE;
+        float abs_rpm       = fabsf(pid->target_rpm);
+        float ff_magnitude  = (float)DEADBAND_PWM + abs_rpm * RPM_TO_PWM_SCALE;
         float ff_with_sign  = (pid->target_rpm > 0.0f) ? ff_magnitude : -ff_magnitude;
 
         /* 총 출력 = 피드포워드 + PID 보정 */

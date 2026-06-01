@@ -31,7 +31,7 @@ extern "C" {
 #define TRACK_WIDTH_M           0.51f           /**< 좌우 트랙 폭 (m)      */
 #define MOTOR_MAX_RPM           150.0f          /**< 최대 부하 속도 (RPM)   */
 #define ENCODER_CPR             1404U           /**< 엔코더 해상도 (CPR)    */
-#define DEADBAND_PWM            2000U           /**< 최소 기동 PWM (실측값) */
+#define DEADBAND_PWM            500U           /**< 최소 기동 PWM (실측값) */
 #define MOTOR_PWM_MAX           9999U           /**< 최대 PWM 값            */
 #define PID_PERIOD_MS           10U             /**< PID 갱신 주기 (ms)     */
 
