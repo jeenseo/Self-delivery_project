@@ -35,8 +35,8 @@ extern CAN_HandleTypeDef hcan;    /* CAN1 핸들                  */
 /* ── 내부 상수 ───────────────────────────────────────────────── */
 #define PID_PERIOD_S        (PID_PERIOD_MS * 0.001f)
 
-/* RPM→PWM 선형 변환 스케일 (데드밴드 이후 구간) */
-#define RPM_TO_PWM_SCALE    ((float)(MOTOR_PWM_MAX - DEADBAND_PWM) / MOTOR_MAX_RPM)
+/* Zone 2 기울기: KINETIC_PWM_BASE(2000) ~ MOTOR_PWM_MAX(9999) / (MOTOR_MAX_RPM - SMOOTH_RPM) */
+#define KINETIC_PWM_SLOPE   ((float)(MOTOR_PWM_MAX - KINETIC_PWM_BASE) / (MOTOR_MAX_RPM - SMOOTH_RPM))
 
 /* 클램프 매크로 */
 #define CLAMP(x, lo, hi)    ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
@@ -166,25 +166,41 @@ static void _drive_side(PID_t             *pid,
     }
     else
     {
-        /* ── 피드포워드(상수 DEADBAND) + PID 보정 ──────────── */
+        /* ── 2단계 피드포워드(Piecewise) + PID 보정 ──────── */
         float pid_correction = _pid_compute(pid, measured);
 
         /*
-         * [복원] 상수 DEADBAND 피드포워드
+         * 2단계 피드포워드 (수학적 연속 구간 함수)
          *
-         * 이전의 "비례 데드밴드(soft-start)" 로직은 수학적으로 타당하지만,
-         * 물리적으로 Mecanum 스키드-스티어 로봇에서 치명적 문제 발생:
-         *   - 높은 정적 마찰 + 불균일 지면 접촉으로 인해
-         *     PWM < DEADBAND_PWM(2000) 구간에서 모터 스톨, 좌우 지터 발생
-         *   - DEADBAND_PWM(2000) ≈ 0.195 m/s가 실질적 물리 최소 속도
+         * Zone 1 — Stiction Zone (0 < RPM ≤ SMOOTH_RPM=31.8 ≈ 0.20 m/s):
+         *   ff = STICTION_PWM_BASE(1300) + (abs_rpm / SMOOTH_RPM) × 700
+         *   → 정지마찰 극복 구간. PWM을 1300에서 2000으로 선형 증가.
+         *   → Nav2 0.05~0.20 m/s 미속 명령에서 스티션 없이 부드럽게 기동.
          *
-         * 해결 전략: Nav2 파라미터(min_speed_xy=0.15 m/s)로 미속 명령 차단
-         *   → Nav2가 0.15 m/s 이상만 요청하므로 soft-start 불필요
-         *   → STM32는 항상 안정 구동 범위(≥DEADBAND_PWM)에서 동작
+         * Zone 2 — Kinetic Zone (RPM > SMOOTH_RPM):
+         *   ff = KINETIC_PWM_BASE(2000) + (abs_rpm - SMOOTH_RPM) × SLOPE
+         *   → 동역학 구간. PWM을 2000에서 9999으로 선형 증가.
+         *
+         * 연결점 검증: Zone1(31.8) = 1300 + 700 = 2000 = Zone2(31.8) ✓
          */
-        float abs_rpm       = fabsf(pid->target_rpm);
-        float ff_magnitude  = (float)DEADBAND_PWM + abs_rpm * RPM_TO_PWM_SCALE;
-        float ff_with_sign  = (pid->target_rpm > 0.0f) ? ff_magnitude : -ff_magnitude;
+        float abs_rpm = fabsf(pid->target_rpm);
+        float ff_magnitude;
+
+        if (abs_rpm <= SMOOTH_RPM)
+        {
+            /* Zone 1: Stiction Zone → PWM 1300~2000 선형 증가 */
+            ff_magnitude = (float)STICTION_PWM_BASE
+                           + (abs_rpm / SMOOTH_RPM)
+                           * (float)(KINETIC_PWM_BASE - STICTION_PWM_BASE);
+        }
+        else
+        {
+            /* Zone 2: Kinetic Zone → PWM 2000~9999 선형 증가 */
+            ff_magnitude = (float)KINETIC_PWM_BASE
+                           + (abs_rpm - SMOOTH_RPM) * KINETIC_PWM_SLOPE;
+        }
+
+        float ff_with_sign = (pid->target_rpm > 0.0f) ? ff_magnitude : -ff_magnitude;
 
         /* 총 출력 = 피드포워드 + PID 보정 */
         float total = ff_with_sign + pid_correction;

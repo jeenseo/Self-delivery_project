@@ -1,6 +1,6 @@
 /**
  * @file   motor.h
- * @brief  STM32 스키드-스티어 모터 제어 — PID + 엔코더 + CAN TX
+ * @brief  STM32 스키드-스티어 모터 제어 — 2단계 피드포워드 + PID + 엔코더 + CAN TX
  *
  * [하드웨어 핀 매핑]
  *   위치    │ DIR 핀  │ PWM 타이머/채널      │ PWM 핀
@@ -31,25 +31,46 @@ extern "C" {
 #define TRACK_WIDTH_M           0.51f           /**< 좌우 트랙 폭 (m)      */
 #define MOTOR_MAX_RPM           150.0f          /**< 최대 부하 속도 (RPM)   */
 #define ENCODER_CPR             1404U           /**< 엔코더 해상도 (CPR)    */
-#define DEADBAND_PWM            500U           /**< 최소 기동 PWM (실측값) */
 #define MOTOR_PWM_MAX           9999U           /**< 최대 PWM 값            */
 #define PID_PERIOD_MS           10U             /**< PID 갱신 주기 (ms)     */
+
+/* ─────────────────────────────────────────────────────────────
+ * 2단계 피드포워드 상수 (2-Stage Piecewise Feedforward)
+ *
+ * Zone 1 (Stiction Zone):  0 < RPM ≤ SMOOTH_RPM (31.8)
+ *   → PWM: STICTION_PWM_BASE(1300) 선형 증가 → KINETIC_PWM_BASE(2000)
+ *   → 정지마찰(스티션) 극복 구간 (Nav2 0.05~0.20 m/s)
+ *
+ * Zone 2 (Kinetic Zone):   RPM > SMOOTH_RPM (31.8)
+ *   → PWM: KINETIC_PWM_BASE(2000) 선형 증가 → MOTOR_PWM_MAX(9999)
+ *   → 동역학 구간 (속도에 비례)
+ *
+ * 수학적 연속성 검증 (PWM 2000에서 연결):
+ *   Zone 1 끝: 1300 + (31.8/31.8)×700 = 2000 ✓
+ *   Zone 2 시작: 2000 + (31.8-31.8)×slope = 2000 ✓
+ * ───────────────────────────────────────────────────────────── */
+#define STICTION_PWM_BASE       1300U           /**< 정지마찰 극복 Zone 1 시작 PWM */
+#define KINETIC_PWM_BASE        2000U           /**< Zone 2 기저 PWM (연결점)      */
+#define SMOOTH_RPM              31.8f           /**< Zone 전환 RPM (≈0.20 m/s)     */
 
 /* ─────────────────────────────────────────────────────────────
  * 방향 반전 매크로 (Direction Inversion per Wheel)
  *   0 = 정상 (DIR HIGH=전진)
  *   1 = 반전 (DIR LOW=전진) — 물리적 역결선 바퀴에 사용
  * ───────────────────────────────────────────────────────────── */
-#define FL_DIR_INVERT           1   /**< 좌측 전륜 — 필요 시 1로 변경 */
-#define FR_DIR_INVERT           0   /**< 우측 전륜 — 필요 시 1로 변경 */
-#define RL_DIR_INVERT           1   /**< 좌측 후륜 — 필요 시 1로 변경 */
-#define RR_DIR_INVERT           0  /**< 우측 후륜 — 필요 시 1로 변경 */
+#define FL_DIR_INVERT           1
+#define FR_DIR_INVERT           0
+#define RL_DIR_INVERT           1
+#define RR_DIR_INVERT           0
 
 /* ─────────────────────────────────────────────────────────────
  * PID 조정 파라미터 (Tunable PID Gains)
+ *
+ * 2단계 피드포워드가 약 95% 담당 → PID는 미세 보정(Sniper) 역할
+ * KI는 낮게 유지하여 적분 윈드업 방지
  * ───────────────────────────────────────────────────────────── */
 #define MOTOR_KP                2.0f    /**< 비례 이득 */
-#define MOTOR_KI                0.5f    /**< 적분 이득 */
+#define MOTOR_KI                1.0f    /**< 적분 이득 (부하 변동 대응) */
 #define MOTOR_KD                0.05f   /**< 미분 이득 */
 
 /* ─────────────────────────────────────────────────────────────
@@ -62,38 +83,10 @@ extern "C" {
  * 공개 API (Public API)
  * ───────────────────────────────────────────────────────────── */
 
-/**
- * @brief PID 상태, 엔코더 카운터 초기화
- *        Motor_Drive() / Motor_PID_Update() 사용 전 반드시 호출
- */
 void Motor_Init(void);
-
-/**
- * @brief CAN 수신값으로 4-휠 목표 속도 설정 (PID 입력)
- * @param fl  Front Left  (-9999 ~ +9999, 양수=전진)
- * @param fr  Front Right
- * @param rl  Rear Left
- * @param rr  Rear Right
- */
 void Motor_Drive(int16_t fl, int16_t fr, int16_t rl, int16_t rr);
-
-/**
- * @brief PID 1 사이클 실행 (10ms 주기로 호출)
- *        엔코더 읽기 → 속도 계산 → PID 연산 → PWM 출력
- *        CAN TX 누산기에도 엔코더 틱을 누적
- */
 void Motor_PID_Update(void);
-
-/**
- * @brief 엔코더 피드백을 CAN 0x124로 전송 (20ms 주기로 호출)
- *        Payload: [Left_delta(2B)][Right_delta(2B)] Big-Endian
- *        Pi에서 /odom_wheel 토픽 계산에 사용
- */
 void Motor_Send_Feedback_CAN(void);
-
-/**
- * @brief 모든 모터 즉시 정지 + PID 상태 리셋
- */
 void Motor_Stop(void);
 
 #ifdef __cplusplus
