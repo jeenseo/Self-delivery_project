@@ -1,22 +1,34 @@
 /**
  * @file   motor.c
- * @brief  STM32 스키드-스티어 4-휠 모터 제어
- *         PID 속도 제어 + 엔코더 피드백 + CAN TX (0x124)
+ * @brief  STM32 메카넘 4-휠 모터 제어 — 하이브리드 PID/Open-Loop
  *
- * [아키텍처]
- *   CAN RX 0x123: Motor_Drive(fl, fr, rl, rr) → 목표 속도 설정
- *   10ms 주기:    Motor_PID_Update()          → 엔코더→RPM→PID→PWM
- *   20ms 주기:    Motor_Send_Feedback_CAN()   → 누산 틱 → Pi
+ * [아키텍처: 하이브리드 제어 전략]
  *
- * [좌/우 PID 분리 (2 엔코더, 4 바퀴)]
- *   TIM3 (Left Enc)  → FL + RL 공통 PID 제어
- *   TIM4 (Right Enc) → FR + RR 공통 PID 제어
- *   CAN 입력: left_target  = (rxFL + rxRL) / 2
- *             right_target = (rxFR + rxRR) / 2
+ *   2개 엔코더(TIM3=Left, TIM4=Right)로 메카넘 4-휠을 제어하는 근본적 문제:
+ *   스트레이핑(Vy) 시 FL↑RL↓ 또는 FL↓RL↑ → 좌측 엔코더 평균 ≈ 0 → PID 오작동
  *
- * [데드밴드 보상]
- *   목표 ≠ 0 → base PWM = DEADBAND_PWM + PID 보정
- *   목표 = 0 → 즉시 정지 (PWM=0)
+ *   해결: 스트레이핑 여부를 감지하여 두 모드로 동적 전환
+ *
+ *   [CTRL_CLOSED_LOOP] 순수 X/Yaw 이동:
+ *     - 기존 좌/우 평균 PID 유지
+ *     - left_avg_target  = (FL + RL) / 2
+ *     - right_avg_target = (FR + RR) / 2
+ *
+ *   [CTRL_OPEN_LOOP] 스트레이핑 감지:
+ *     - 4바퀴 독립 2단계 피드포워드 (PID 우회)
+ *     - PID 적분 리셋으로 윈드업 방지
+ *
+ * [스트레이핑 감지 수식]
+ *   메카넘 X-구성에서:
+ *     FL = Vx - Vy - Wz·l,  FR = Vx + Vy + Wz·l
+ *     RL = Vx + Vy - Wz·l,  RR = Vx - Vy + Wz·l
+ *   implied_Vy = (-FL + FR + RL - RR) / 4  (정규화 공간)
+ *   → Vx, Wz 항은 소거되고 Vy만 남음
+ *   → |implied_Vy| > STRAFE_DETECT_THRESHOLD → CTRL_OPEN_LOOP
+ *
+ * [2단계 피드포워드]
+ *   Zone 1 (0 < RPM ≤ SMOOTH_RPM): PWM 1300→2000 (스티션 극복)
+ *   Zone 2 (RPM > SMOOTH_RPM):     PWM 2000→9999 (동역학 구간)
  */
 
 #include "motor.h"
@@ -25,106 +37,145 @@
 #include <string.h>
 #include <math.h>
 
-/* ── 외부 핸들 선언 ──────────────────────────────────────────── */
-extern TIM_HandleTypeDef htim1;   /* FL/FR PWM (TIM1_CH1, CH2) */
-extern TIM_HandleTypeDef htim2;   /* RL/RR PWM (TIM2_CH1, CH2) */
-extern TIM_HandleTypeDef htim3;   /* 좌측 엔코더               */
-extern TIM_HandleTypeDef htim4;   /* 우측 엔코더               */
-extern CAN_HandleTypeDef hcan;    /* CAN1 핸들                  */
+/* ── 외부 핸들 ───────────────────────────────────────────────── */
+extern TIM_HandleTypeDef htim1;   /* FL(CH1)/FR(CH2) PWM */
+extern TIM_HandleTypeDef htim2;   /* RL(CH1)/RR(CH2) PWM */
+extern TIM_HandleTypeDef htim3;   /* 좌측 엔코더 */
+extern TIM_HandleTypeDef htim4;   /* 우측 엔코더 */
+extern CAN_HandleTypeDef hcan;    /* CAN1 */
 
 /* ── 내부 상수 ───────────────────────────────────────────────── */
 #define PID_PERIOD_S        (PID_PERIOD_MS * 0.001f)
 
-/* Zone 2 기울기: KINETIC_PWM_BASE(2000) ~ MOTOR_PWM_MAX(9999) / (MOTOR_MAX_RPM - SMOOTH_RPM) */
-#define KINETIC_PWM_SLOPE   ((float)(MOTOR_PWM_MAX - KINETIC_PWM_BASE) / (MOTOR_MAX_RPM - SMOOTH_RPM))
+/* Zone 2 기울기: 2000→9999 / (MAX_RPM - SMOOTH_RPM) */
+#define KINETIC_PWM_SLOPE   ((float)(MOTOR_PWM_MAX - KINETIC_PWM_BASE) \
+                             / (MOTOR_MAX_RPM - SMOOTH_RPM))
 
-/* 클램프 매크로 */
-#define CLAMP(x, lo, hi)    ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
+/* 스트레이핑 감지 임계값 (정규화 속도 기준, 5% = 500/9999) */
+#define STRAFE_DETECT_THRESHOLD  500.0f
 
-/* 적분 누적 한계 (Anti-Windup) */
+/* 클램프 */
+#define CLAMP(x, lo, hi)    ((x)<(lo)?(lo):((x)>(hi)?(hi):(x)))
+
+/* 적분 Anti-Windup 한계 */
 #define INTEGRAL_LIMIT      (MOTOR_MAX_RPM * 2.0f)
+
+/* ── 제어 상태 열거형 ─────────────────────────────────────────── */
+typedef enum {
+    CTRL_CLOSED_LOOP = 0,  /**< PID 제어: 순수 X/Yaw 이동          */
+    CTRL_OPEN_LOOP   = 1,  /**< 피드포워드: 스트레이핑 감지 시 사용  */
+} ControlState_t;
 
 /* ── PID 상태 구조체 ─────────────────────────────────────────── */
 typedef struct {
-    float target_rpm;   /**< 목표 속도 (RPM, 양수=전진) */
-    float integral;     /**< 적분 누적값                */
-    float prev_error;   /**< 이전 오차 (미분 계산용)     */
+    float target_rpm;
+    float integral;
+    float prev_error;
 } PID_t;
 
 /* ── 모듈 내부 상태 ──────────────────────────────────────────── */
-static PID_t   s_pid_left;            /* 좌측 PID 상태 */
-static PID_t   s_pid_right;           /* 우측 PID 상태 */
+static PID_t          s_pid_left;
+static PID_t          s_pid_right;
+static ControlState_t s_ctrl_state = CTRL_CLOSED_LOOP;
 
-static int32_t s_enc_left_last  = 0;  /* 이전 TIM3 카운터 */
-static int32_t s_enc_right_last = 0;  /* 이전 TIM4 카운터 */
+/* 4바퀴 독립 명령 (CAN 수신값 그대로 저장) */
+static int16_t s_cmd_fl = 0;
+static int16_t s_cmd_fr = 0;
+static int16_t s_cmd_rl = 0;
+static int16_t s_cmd_rr = 0;
 
-/* CAN TX 누산기: Motor_PID_Update() 마다 틱을 누적 */
+/* 엔코더 카운터 */
+static int32_t s_enc_left_last  = 0;
+static int32_t s_enc_right_last = 0;
+
+/* CAN TX 누산기 */
 static int32_t s_fb_left_accum  = 0;
 static int32_t s_fb_right_accum = 0;
 
-/* ════════════════════════════════════════════════════════════
- *  내부 헬퍼 함수
- * ════════════════════════════════════════════════════════════ */
-
-/**
- * @brief Sign-Magnitude 방식으로 단일 채널 DIR+PWM 설정
- *
- * @param pin_dir  GPIOC DIR 핀 마스크 (예: GPIO_PIN_2)
- * @param tim      PWM 타이머 핸들 포인터
- * @param ch       타이머 채널 (TIM_CHANNEL_x)
- * @param speed    속도값 (-9999 ~ +9999, 양수=전진)
- * @param invert   방향 반전 플래그 (0=정상, 1=반전)
- */
-static void _set_wheel(uint16_t             pin_dir,
-                       TIM_HandleTypeDef   *tim,
-                       uint32_t             ch,
-                       int16_t              speed,
-                       uint8_t              invert)
+/* ════════════════════════════════════════════════════════════════
+ *  내부 헬퍼: DIR+PWM 단일 채널 설정 (Sign-Magnitude)
+ * ════════════════════════════════════════════════════════════════ */
+static void _set_wheel(uint16_t           pin_dir,
+                       TIM_HandleTypeDef *tim,
+                       uint32_t           ch,
+                       int16_t            speed,
+                       uint8_t            invert)
 {
-    /* 범위 클램프 */
     if (speed >  (int16_t)MOTOR_PWM_MAX) speed =  (int16_t)MOTOR_PWM_MAX;
     if (speed < -(int16_t)MOTOR_PWM_MAX) speed = -(int16_t)MOTOR_PWM_MAX;
 
-    uint32_t     pwm = (speed >= 0) ? (uint32_t)speed : (uint32_t)(-speed);
+    uint32_t      pwm = (speed >= 0) ? (uint32_t)speed : (uint32_t)(-speed);
     GPIO_PinState dir;
 
-    if (speed > 0)
-    {
-        /* 전진: invert=0 → HIGH, invert=1 → LOW */
-        dir = invert ? GPIO_PIN_RESET : GPIO_PIN_SET;
-    }
-    else if (speed < 0)
-    {
-        /* 후진: invert=0 → LOW, invert=1 → HIGH */
-        dir = invert ? GPIO_PIN_SET : GPIO_PIN_RESET;
-    }
-    else
-    {
-        /* 정지 */
-        dir = GPIO_PIN_RESET;
-        pwm = 0U;
-    }
+    if      (speed > 0) dir = invert ? GPIO_PIN_RESET : GPIO_PIN_SET;
+    else if (speed < 0) dir = invert ? GPIO_PIN_SET   : GPIO_PIN_RESET;
+    else { dir = GPIO_PIN_RESET; pwm = 0U; }
 
     HAL_GPIO_WritePin(GPIOC, pin_dir, dir);
     __HAL_TIM_SET_COMPARE(tim, ch, pwm);
 }
 
+/* ════════════════════════════════════════════════════════════════
+ *  내부 헬퍼: 2단계 피드포워드 PWM 계산
+ * ════════════════════════════════════════════════════════════════ */
 /**
- * @brief 단일 PID 연산 (1 사이클)
+ * @brief 목표 RPM → 2단계 피드포워드 PWM (부호 포함)
  *
- * @param pid          PID 상태 포인터
- * @param measured_rpm 현재 측정 속도 (RPM)
- * @return             PWM 보정량 (RPM 오차 기반)
+ * Zone 1 (스티션): |RPM| ≤ SMOOTH_RPM → PWM 1300~2000 선형
+ * Zone 2 (동역학): |RPM| >  SMOOTH_RPM → PWM 2000~9999 선형
+ * 연결점: Zone1(SMOOTH_RPM) = Zone2(SMOOTH_RPM) = 2000 ✓
  */
+static float _calc_feedforward(float target_rpm)
+{
+    float abs_rpm = fabsf(target_rpm);
+    float ff_mag;
+
+    if (abs_rpm <= SMOOTH_RPM)
+    {
+        /* Zone 1: 스티션 극복 (PWM 1300 → 2000) */
+        ff_mag = (float)STICTION_PWM_BASE
+                 + (abs_rpm / SMOOTH_RPM)
+                 * (float)(KINETIC_PWM_BASE - STICTION_PWM_BASE);
+    }
+    else
+    {
+        /* Zone 2: 동역학 구간 (PWM 2000 → 9999) */
+        ff_mag = (float)KINETIC_PWM_BASE
+                 + (abs_rpm - SMOOTH_RPM) * KINETIC_PWM_SLOPE;
+    }
+
+    return (target_rpm >= 0.0f) ? ff_mag : -ff_mag;
+}
+
+/* ════════════════════════════════════════════════════════════════
+ *  내부 헬퍼: Open-Loop 단일 채널 구동 (PID 없이 FF만)
+ * ════════════════════════════════════════════════════════════════ */
+static void _drive_wheel_open_loop(uint16_t           pin_dir,
+                                    TIM_HandleTypeDef *tim,
+                                    uint32_t           ch,
+                                    float              target_rpm,
+                                    uint8_t            invert)
+{
+    if (fabsf(target_rpm) < 0.5f)
+    {
+        _set_wheel(pin_dir, tim, ch, 0, invert);
+        return;
+    }
+    float ff    = _calc_feedforward(target_rpm);
+    float total = CLAMP(ff, -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
+    _set_wheel(pin_dir, tim, ch, (int16_t)total, invert);
+}
+
+/* ════════════════════════════════════════════════════════════════
+ *  내부 헬퍼: PID 연산
+ * ════════════════════════════════════════════════════════════════ */
 static float _pid_compute(PID_t *pid, float measured_rpm)
 {
-    float error      = pid->target_rpm - measured_rpm;
+    float error = pid->target_rpm - measured_rpm;
 
-    /* 적분 누적 + Anti-Windup 클램프 */
-    pid->integral   += error * PID_PERIOD_S;
-    pid->integral    = CLAMP(pid->integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+    pid->integral += error * PID_PERIOD_S;
+    pid->integral  = CLAMP(pid->integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
 
-    /* 미분 */
     float derivative = (error - pid->prev_error) / PID_PERIOD_S;
     pid->prev_error  = error;
 
@@ -133,218 +184,205 @@ static float _pid_compute(PID_t *pid, float measured_rpm)
          + (MOTOR_KD * derivative);
 }
 
-/**
- * @brief 목표 RPM → 피드포워드 PWM + PID 보정 → 모터 출력
- *
- * @param pid         PID 상태 포인터
- * @param measured    현재 측정 RPM
- * @param dir_pin_a   첫 번째 바퀴 DIR 핀
- * @param tim_a       첫 번째 바퀴 타이머
- * @param ch_a        첫 번째 바퀴 채널
- * @param invert_a    첫 번째 바퀴 반전 플래그
- * @param dir_pin_b   두 번째 바퀴 DIR 핀
- * @param tim_b       두 번째 바퀴 타이머
- * @param ch_b        두 번째 바퀴 채널
- * @param invert_b    두 번째 바퀴 반전 플래그
- */
-static void _drive_side(PID_t             *pid,
-                        float              measured,
-                        uint16_t           dir_pin_a,
-                        TIM_HandleTypeDef *tim_a,
-                        uint32_t           ch_a,
-                        uint8_t            invert_a,
-                        uint16_t           dir_pin_b,
-                        TIM_HandleTypeDef *tim_b,
-                        uint32_t           ch_b,
-                        uint8_t            invert_b)
+/* ════════════════════════════════════════════════════════════════
+ *  내부 헬퍼: Closed-Loop 한 쪽(좌 또는 우) 구동
+ *   — 두 바퀴가 공통 PID를 공유 (엔코더 평균 기반)
+ * ════════════════════════════════════════════════════════════════ */
+static void _drive_side_closed(PID_t             *pid,
+                                float              measured,
+                                uint16_t           pin_a,
+                                TIM_HandleTypeDef *tim_a,
+                                uint32_t           ch_a,
+                                uint8_t            inv_a,
+                                uint16_t           pin_b,
+                                TIM_HandleTypeDef *tim_b,
+                                uint32_t           ch_b,
+                                uint8_t            inv_b)
 {
     if (fabsf(pid->target_rpm) < 0.5f)
     {
-        /* ── 목표=0: 즉시 정지 ────────────────────────────── */
-        _set_wheel(dir_pin_a, tim_a, ch_a, 0, invert_a);
-        _set_wheel(dir_pin_b, tim_b, ch_b, 0, invert_b);
+        _set_wheel(pin_a, tim_a, ch_a, 0, inv_a);
+        _set_wheel(pin_b, tim_b, ch_b, 0, inv_b);
+        return;
     }
-    else
-    {
-        /* ── 2단계 피드포워드(Piecewise) + PID 보정 ──────── */
-        float pid_correction = _pid_compute(pid, measured);
 
-        /*
-         * 2단계 피드포워드 (수학적 연속 구간 함수)
-         *
-         * Zone 1 — Stiction Zone (0 < RPM ≤ SMOOTH_RPM=31.8 ≈ 0.20 m/s):
-         *   ff = STICTION_PWM_BASE(1300) + (abs_rpm / SMOOTH_RPM) × 700
-         *   → 정지마찰 극복 구간. PWM을 1300에서 2000으로 선형 증가.
-         *   → Nav2 0.05~0.20 m/s 미속 명령에서 스티션 없이 부드럽게 기동.
-         *
-         * Zone 2 — Kinetic Zone (RPM > SMOOTH_RPM):
-         *   ff = KINETIC_PWM_BASE(2000) + (abs_rpm - SMOOTH_RPM) × SLOPE
-         *   → 동역학 구간. PWM을 2000에서 9999으로 선형 증가.
-         *
-         * 연결점 검증: Zone1(31.8) = 1300 + 700 = 2000 = Zone2(31.8) ✓
-         */
-        float abs_rpm = fabsf(pid->target_rpm);
-        float ff_magnitude;
+    float pid_correction = _pid_compute(pid, measured);
+    float ff             = _calc_feedforward(pid->target_rpm);
+    float total          = CLAMP(ff + pid_correction,
+                                 -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
+    int16_t cmd          = (int16_t)total;
 
-        if (abs_rpm <= SMOOTH_RPM)
-        {
-            /* Zone 1: Stiction Zone → PWM 1300~2000 선형 증가 */
-            ff_magnitude = (float)STICTION_PWM_BASE
-                           + (abs_rpm / SMOOTH_RPM)
-                           * (float)(KINETIC_PWM_BASE - STICTION_PWM_BASE);
-        }
-        else
-        {
-            /* Zone 2: Kinetic Zone → PWM 2000~9999 선형 증가 */
-            ff_magnitude = (float)KINETIC_PWM_BASE
-                           + (abs_rpm - SMOOTH_RPM) * KINETIC_PWM_SLOPE;
-        }
-
-        float ff_with_sign = (pid->target_rpm > 0.0f) ? ff_magnitude : -ff_magnitude;
-
-        /* 총 출력 = 피드포워드 + PID 보정 */
-        float total = ff_with_sign + pid_correction;
-        total       = CLAMP(total, -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
-
-        int16_t cmd = (int16_t)total;
-        _set_wheel(dir_pin_a, tim_a, ch_a, cmd, invert_a);
-        _set_wheel(dir_pin_b, tim_b, ch_b, cmd, invert_b);
-    }
+    _set_wheel(pin_a, tim_a, ch_a, cmd, inv_a);
+    _set_wheel(pin_b, tim_b, ch_b, cmd, inv_b);
 }
 
-/* ════════════════════════════════════════════════════════════
- *  공개 API 구현
- * ════════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════════
+ *  공개 API
+ * ════════════════════════════════════════════════════════════════ */
 
-/**
- * @brief 모듈 초기화 — PID 상태 리셋 + 엔코더 기준값 설정
- *        Motor_Drive() / Motor_PID_Update() 호출 전 반드시 실행
- */
 void Motor_Init(void)
 {
     memset(&s_pid_left,  0, sizeof(PID_t));
     memset(&s_pid_right, 0, sizeof(PID_t));
 
-    /* 현재 엔코더 카운터를 기준값으로 저장 */
+    s_cmd_fl = s_cmd_fr = s_cmd_rl = s_cmd_rr = 0;
+    s_ctrl_state = CTRL_CLOSED_LOOP;
+
     s_enc_left_last  = (int32_t)__HAL_TIM_GET_COUNTER(&htim3);
     s_enc_right_last = (int32_t)__HAL_TIM_GET_COUNTER(&htim4);
 
     s_fb_left_accum  = 0;
     s_fb_right_accum = 0;
 
-    /* 모든 모터 초기 정지 */
-    _set_wheel(GPIO_PIN_2, &htim1, TIM_CHANNEL_1, 0, FL_DIR_INVERT);  /* FL */
-    _set_wheel(GPIO_PIN_3, &htim1, TIM_CHANNEL_2, 0, FR_DIR_INVERT);  /* FR */
-    _set_wheel(GPIO_PIN_0, &htim2, TIM_CHANNEL_1, 0, RL_DIR_INVERT);  /* RL */
-    _set_wheel(GPIO_PIN_1, &htim2, TIM_CHANNEL_2, 0, RR_DIR_INVERT);  /* RR */
+    _set_wheel(GPIO_PIN_2, &htim1, TIM_CHANNEL_1, 0, FL_DIR_INVERT);
+    _set_wheel(GPIO_PIN_3, &htim1, TIM_CHANNEL_2, 0, FR_DIR_INVERT);
+    _set_wheel(GPIO_PIN_0, &htim2, TIM_CHANNEL_1, 0, RL_DIR_INVERT);
+    _set_wheel(GPIO_PIN_1, &htim2, TIM_CHANNEL_2, 0, RR_DIR_INVERT);
 }
 
 /**
- * @brief CAN 수신값 → 좌/우 PID 목표 속도 설정
+ * @brief CAN 수신 → 4바퀴 독립 목표 저장 + 스트레이핑 감지
  *
- *   좌측 목표 = (rxFL + rxRL) / 2  → RPM 변환
- *   우측 목표 = (rxFR + rxRR) / 2  → RPM 변환
- *
- *   목표가 0으로 전환되면 적분 누적을 즉시 리셋
- *   (빠른 정지 응답 및 오버슈트 방지)
+ * 스트레이핑 감지 수식:
+ *   implied_Vy = (-FL + FR + RL - RR) / 4  (정규화 CAN 값 기준)
+ *   Vx, Wz 항은 소거되고 Vy 성분만 추출됨
+ *   |implied_Vy| > STRAFE_DETECT_THRESHOLD → CTRL_OPEN_LOOP
  */
 void Motor_Drive(int16_t fl, int16_t fr, int16_t rl, int16_t rr)
 {
-    /* 좌/우 평균 (스키드-스티어: 동측 바퀴는 항상 동일 속도) */
-    int32_t left_avg  = ((int32_t)fl + (int32_t)rl) / 2;
-    int32_t right_avg = ((int32_t)fr + (int32_t)rr) / 2;
+    s_cmd_fl = fl;
+    s_cmd_fr = fr;
+    s_cmd_rl = rl;
+    s_cmd_rr = rr;
 
-    /* CAN 범위(-9999~+9999) → RPM (-MOTOR_MAX_RPM ~ +MOTOR_MAX_RPM) */
-    s_pid_left.target_rpm  = (float)left_avg  / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
-    s_pid_right.target_rpm = (float)right_avg / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
+    /* ── 스트레이핑 감지 ─────────────────────────────────────── */
+    /* 메카넘 X-구성: implied_Vy = (-FL + FR + RL - RR) / 4      */
+    float implied_vy = (float)(-fl + fr + rl - rr) / 4.0f;
 
-    /* 목표=0 전환 시 적분/미분 상태 초기화 */
-    if (left_avg == 0) {
+    ControlState_t new_state =
+        (fabsf(implied_vy) > STRAFE_DETECT_THRESHOLD)
+        ? CTRL_OPEN_LOOP
+        : CTRL_CLOSED_LOOP;
+
+    if (new_state != s_ctrl_state)
+    {
+        /* ── 상태 전환: PID 적분 초기화 (윈드업 방지) ─────────── */
         s_pid_left.integral   = 0.0f;
         s_pid_left.prev_error = 0.0f;
-    }
-    if (right_avg == 0) {
-        s_pid_right.integral   = 0.0f;
+        s_pid_right.integral  = 0.0f;
         s_pid_right.prev_error = 0.0f;
+        s_ctrl_state = new_state;
+    }
+
+    /* ── Closed-Loop 시 PID 목표 설정 ───────────────────────── */
+    if (s_ctrl_state == CTRL_CLOSED_LOOP)
+    {
+        /* 좌/우 평균으로 엔코더 기반 PID (Vy 소거 원리 활용) */
+        int32_t left_avg  = ((int32_t)fl + (int32_t)rl) / 2;
+        int32_t right_avg = ((int32_t)fr + (int32_t)rr) / 2;
+
+        s_pid_left.target_rpm  = (float)left_avg
+                                 / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
+        s_pid_right.target_rpm = (float)right_avg
+                                 / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
+
+        if (left_avg == 0)
+        {
+            s_pid_left.integral   = 0.0f;
+            s_pid_left.prev_error = 0.0f;
+        }
+        if (right_avg == 0)
+        {
+            s_pid_right.integral   = 0.0f;
+            s_pid_right.prev_error = 0.0f;
+        }
     }
 }
 
 /**
- * @brief PID 1 사이클 실행 — 10ms 주기로 main 루프에서 호출
+ * @brief PID 1 사이클 실행 (10ms 주기)
  *
- * 처리 순서:
- *   1. TIM3/TIM4 카운터 읽기
- *   2. 16비트 오버플로우 처리: delta = (int16_t)(current - last)
- *   3. RPM 변환: rpm = delta × 60 / (CPR × PID_PERIOD_S)
- *   4. 좌/우 PID 연산 → PWM + DIR 출력
- *   5. CAN TX 누산기에 틱 추가
+ * CTRL_CLOSED_LOOP: 좌/우 평균 PID (기존 방식, 엔코더 신뢰 가능)
+ * CTRL_OPEN_LOOP:   4바퀴 독립 2단계 피드포워드 (PID 우회)
  */
 void Motor_PID_Update(void)
 {
-    /* ── 엔코더 카운터 읽기 ──────────────────────────────── */
+    /* ── 엔코더 읽기 ─────────────────────────────────────────── */
     int32_t cur_left  = (int32_t)__HAL_TIM_GET_COUNTER(&htim3);
     int32_t cur_right = (int32_t)__HAL_TIM_GET_COUNTER(&htim4);
 
-    /*
-     * int16_t 캐스트: 16비트 카운터 오버플로우 자동 처리
-     *   예) last=65500, cur=50 → delta = (int16_t)(50-65500) = +86 ✓
-     */
     int16_t delta_left  = (int16_t)((uint16_t)cur_left  - (uint16_t)s_enc_left_last);
     int16_t delta_right = (int16_t)((uint16_t)cur_right - (uint16_t)s_enc_right_last);
 
     s_enc_left_last  = cur_left;
     s_enc_right_last = cur_right;
 
-    /* CAN TX 피드백 누산 (20ms마다 전송, 2사이클 누적) */
     s_fb_left_accum  += (int32_t)delta_left;
     s_fb_right_accum += (int32_t)delta_right;
 
-    /* ── RPM 계산 ─────────────────────────────────────────
-     *  RPM = (delta_counts / CPR) × (60 / PID_PERIOD_S)
-     *      = delta × 60 / (1404 × 0.01) = delta × 4.2735
-     * ─────────────────────────────────────────────────── */
-    float rpm_scale = 60.0f / ((float)ENCODER_CPR * PID_PERIOD_S);
-    float meas_left  = (float)delta_left  * rpm_scale;
-    float meas_right = (float)delta_right * rpm_scale;
+    /* ── RPM 계산 ────────────────────────────────────────────── */
+    float rpm_scale   = 60.0f / ((float)ENCODER_CPR * PID_PERIOD_S);
+    float meas_left   = (float)delta_left  * rpm_scale;
+    float meas_right  = (float)delta_right * rpm_scale;
 
-    /* ── 좌측 PID → FL + RL ──────────────────────────── */
-    _drive_side(&s_pid_left,  meas_left,
-                GPIO_PIN_2, &htim1, TIM_CHANNEL_1, FL_DIR_INVERT,  /* FL */
-                GPIO_PIN_0, &htim2, TIM_CHANNEL_1, RL_DIR_INVERT); /* RL */
+    /* ════════════════════════════════════════════════════════════
+     *  제어 모드 분기
+     * ════════════════════════════════════════════════════════════ */
+    if (s_ctrl_state == CTRL_CLOSED_LOOP)
+    {
+        /* ── Closed-Loop: 좌/우 평균 PID ──────────────────────── */
+        _drive_side_closed(&s_pid_left,  meas_left,
+                           GPIO_PIN_2, &htim1, TIM_CHANNEL_1, FL_DIR_INVERT,
+                           GPIO_PIN_0, &htim2, TIM_CHANNEL_1, RL_DIR_INVERT);
 
-    /* ── 우측 PID → FR + RR ──────────────────────────── */
-    _drive_side(&s_pid_right, meas_right,
-                GPIO_PIN_3, &htim1, TIM_CHANNEL_2, FR_DIR_INVERT,  /* FR */
-                GPIO_PIN_1, &htim2, TIM_CHANNEL_2, RR_DIR_INVERT); /* RR */
+        _drive_side_closed(&s_pid_right, meas_right,
+                           GPIO_PIN_3, &htim1, TIM_CHANNEL_2, FR_DIR_INVERT,
+                           GPIO_PIN_1, &htim2, TIM_CHANNEL_2, RR_DIR_INVERT);
+    }
+    else
+    {
+        /* ── Open-Loop: 4바퀴 독립 피드포워드 ─────────────────── */
+        /* 각 바퀴의 CAN 명령을 RPM으로 변환 후 FF 적용           */
+        float fl_rpm = (float)s_cmd_fl / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
+        float fr_rpm = (float)s_cmd_fr / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
+        float rl_rpm = (float)s_cmd_rl / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
+        float rr_rpm = (float)s_cmd_rr / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
+
+        _drive_wheel_open_loop(GPIO_PIN_2, &htim1, TIM_CHANNEL_1,
+                               fl_rpm, FL_DIR_INVERT);    /* FL */
+        _drive_wheel_open_loop(GPIO_PIN_3, &htim1, TIM_CHANNEL_2,
+                               fr_rpm, FR_DIR_INVERT);    /* FR */
+        _drive_wheel_open_loop(GPIO_PIN_0, &htim2, TIM_CHANNEL_1,
+                               rl_rpm, RL_DIR_INVERT);    /* RL */
+        _drive_wheel_open_loop(GPIO_PIN_1, &htim2, TIM_CHANNEL_2,
+                               rr_rpm, RR_DIR_INVERT);    /* RR */
+    }
 }
 
 /**
- * @brief 엔코더 피드백 CAN 전송 — 20ms 주기로 main 루프에서 호출
+ * @brief 엔코더 피드백 CAN 전송 (20ms 주기)
  *
- * CAN ID  : 0x124
- * Payload : 4바이트 Big-Endian
- *   Byte 0-1: int16_t left_ticks  (좌측 누산 엔코더 틱)
- *   Byte 2-3: int16_t right_ticks (우측 누산 엔코더 틱)
+ * CAN ID 0x124, Payload 4B Big-Endian:
+ *   Byte 0-1: int16 left_ticks
+ *   Byte 2-3: int16 right_ticks
  *
- * Raspberry Pi 오도메트리 계산:
- *   distance_m = ticks × (WHEEL_CIRCUMFERENCE_M / ENCODER_CPR)
- *              = ticks × (0.12π / 1404) ≈ ticks × 0.0002685 m
+ * 하이브리드 오도메트리 수학:
+ *   Pi에서 Left/Right 평균이 Vy 항을 소거하므로
+ *   X 및 Yaw는 2-엔코더로 정확하게 추정 가능.
  */
 void Motor_Send_Feedback_CAN(void)
 {
-    CAN_TxHeaderTypeDef tx_hdr  = {0};
+    CAN_TxHeaderTypeDef tx_hdr = {0};
     uint8_t             tx_data[4] = {0};
     uint32_t            tx_mailbox;
 
-    /* 누산값 클램프 → int16_t */
-    int16_t left_ticks  = (int16_t)CLAMP(s_fb_left_accum,  -32768, 32767);
-    int16_t right_ticks = (int16_t)CLAMP(s_fb_right_accum, -32768, 32767);
+    int16_t lt = (int16_t)CLAMP(s_fb_left_accum,  -32768, 32767);
+    int16_t rt = (int16_t)CLAMP(s_fb_right_accum, -32768, 32767);
 
-    /* Big-Endian 직렬화 */
-    tx_data[0] = (uint8_t)((left_ticks  >> 8) & 0xFF);
-    tx_data[1] = (uint8_t)( left_ticks        & 0xFF);
-    tx_data[2] = (uint8_t)((right_ticks >> 8) & 0xFF);
-    tx_data[3] = (uint8_t)( right_ticks       & 0xFF);
+    tx_data[0] = (uint8_t)((lt >> 8) & 0xFF);
+    tx_data[1] = (uint8_t)( lt       & 0xFF);
+    tx_data[2] = (uint8_t)((rt >> 8) & 0xFF);
+    tx_data[3] = (uint8_t)( rt       & 0xFF);
 
     tx_hdr.StdId              = CAN_FEEDBACK_ID;
     tx_hdr.IDE                = CAN_ID_STD;
@@ -352,20 +390,14 @@ void Motor_Send_Feedback_CAN(void)
     tx_hdr.DLC                = 4U;
     tx_hdr.TransmitGlobalTime = DISABLE;
 
-    /* 누산기 초기화 (전송 성공 여부 무관) */
     s_fb_left_accum  = 0;
     s_fb_right_accum = 0;
 
-    /* CAN TX 요청 (메일박스 여유 없으면 무시됨) */
     (void)HAL_CAN_AddTxMessage(&hcan, &tx_hdr, tx_data, &tx_mailbox);
 }
 
-/**
- * @brief 모든 모터 즉시 정지 + PID 상태 리셋
- */
 void Motor_Stop(void)
 {
-    /* PID 상태 완전 초기화 */
     s_pid_left.target_rpm  = 0.0f;
     s_pid_left.integral    = 0.0f;
     s_pid_left.prev_error  = 0.0f;
@@ -373,7 +405,9 @@ void Motor_Stop(void)
     s_pid_right.integral   = 0.0f;
     s_pid_right.prev_error = 0.0f;
 
-    /* 4채널 즉시 정지 */
+    s_cmd_fl = s_cmd_fr = s_cmd_rl = s_cmd_rr = 0;
+    s_ctrl_state = CTRL_CLOSED_LOOP;
+
     _set_wheel(GPIO_PIN_2, &htim1, TIM_CHANNEL_1, 0, FL_DIR_INVERT);
     _set_wheel(GPIO_PIN_3, &htim1, TIM_CHANNEL_2, 0, FR_DIR_INVERT);
     _set_wheel(GPIO_PIN_0, &htim2, TIM_CHANNEL_1, 0, RL_DIR_INVERT);
