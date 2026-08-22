@@ -2,14 +2,8 @@
 /**
   ******************************************************************************
   * @file    usart.c
-  * @brief   USART2 initialization and printf redirect for Serial Monitor
-  *
-  *          핀 배치:
-  *            PA2 → USART2_TX  (AF_PP)
-  *            PA3 → USART2_RX  (Input Floating)
-  *
-  *          Baud Rate: 115200
-  *          printf → HAL_UART_Transmit (_write 오버라이드)
+  * @brief   This file provides code for the configuration
+  *          of the USART instances.
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -59,6 +53,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
   if(uartHandle->Instance==USART2)
   {
   /* USER CODE BEGIN USART2_MspInit 0 */
+
   /* USER CODE END USART2_MspInit 0 */
     /* USART2 clock enable */
     __HAL_RCC_USART2_CLK_ENABLE();
@@ -78,10 +73,8 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* USART2 interrupt Init */
-    HAL_NVIC_SetPriority(USART2_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(USART2_IRQn);
   /* USER CODE BEGIN USART2_MspInit 1 */
+
   /* USER CODE END USART2_MspInit 1 */
   }
 }
@@ -92,6 +85,7 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
   if(uartHandle->Instance==USART2)
   {
   /* USER CODE BEGIN USART2_MspDeInit 0 */
+
   /* USER CODE END USART2_MspDeInit 0 */
     /* Peripheral clock disable */
     __HAL_RCC_USART2_CLK_DISABLE();
@@ -102,27 +96,21 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
     */
     HAL_GPIO_DeInit(GPIOA, GPIO_PIN_2|GPIO_PIN_3);
 
-    /* USART2 interrupt Deinit */
-    HAL_NVIC_DisableIRQ(USART2_IRQn);
   /* USER CODE BEGIN USART2_MspDeInit 1 */
+
   /* USER CODE END USART2_MspDeInit 1 */
   }
 }
 
 /* USER CODE BEGIN 1 */
-
 #include <stdio.h>
 
-/**
-  * @brief printf 함수가 호출될 때 내부적으로 실행되는 함수입니다.
-  * ptr에 담긴 문자열을 huart2(USART2)를 통해 전송합니다.
-  */
-int _write(int file, char *ptr, int len)
-{
-  // HAL_UART_Transmit을 사용하여 huart2로 데이터를 쏩니다.
-  // 타임아웃을 충분히(HAL_MAX_DELAY) 주어 데이터 누락을 방지합니다.
-  HAL_UART_Transmit(&huart2, (uint8_t *)ptr, (uint16_t)len, HAL_MAX_DELAY);
-  return len;
-}
+/* 디버그 출력이 제어 루프를 막지 못하도록 상한(5ms)을 둡니다. */
+#define PRINTF_TX_TIMEOUT_MS   5U
 
+int _write(int file, char *ptr, int len) {
+    /* 기존의 무한 대기(HAL_MAX_DELAY) 대신 5ms 타임아웃 적용하여 폭주 방지 */
+    HAL_UART_Transmit(&huart2, (uint8_t *)ptr, (uint16_t)len, PRINTF_TX_TIMEOUT_MS);
+    return len;
+}
 /* USER CODE END 1 */
