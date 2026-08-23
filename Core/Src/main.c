@@ -61,7 +61,6 @@
 #include "main.h"
 #include "can.h"
 #include "tim.h"
-#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -220,7 +219,6 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_CAN_Init();
-  MX_USART2_UART_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
