@@ -519,16 +519,29 @@ void Motor_Send_Feedback_CAN(void)
     tx_hdr.DLC                = dlc;
     tx_hdr.TransmitGlobalTime = DISABLE;
 
-    /* ★ 누산기는 '패킹 직후' 비웁니다.
-     *   AddTxMessage 가 실패해도 비우는 것이 맞습니다 — 재전송하면 같은 틱을
-     *   두 번 보내게 되어 오도메트리가 부풀려집니다. 손실이 중복보다 낫습니다. */
-    s_fb_fl_accum = 0;
-    s_fb_fr_accum = 0;
+    /* ★ 누산기는 **송신이 큐에 들어간 경우에만** 비웁니다.
+     *
+     *   [처음에 '무조건 비우기' 로 짰다가 고친 부분]
+     *     "재전송하면 틱이 두 번 나가니 무조건 비우자" 고 생각했는데,
+     *     AddTxMessage 가 실패하는 주된 원인은 **메일박스 3개가 전부 찬 것**
+     *     이고 그때 프레임은 애초에 나가지도 않았습니다. 그런데도 누산기를
+     *     비우면 그 20 ms 치 틱이 영구 소실되어 오도메트리가 과소 적분됩니다.
+     *
+     *   성공했을 때만 비우면 중복도 손실도 없습니다. 실패하면 다음 프레임이
+     *   밀린 분까지 함께 실어 나릅니다. CLAMP 가 int16 오버플로를 막습니다.
+     *
+     *   ※ HAL_OK 는 '메일박스에 들어갔다' 까지만 보장합니다. 버스 레벨에서
+     *     ACK 를 못 받아 폐기되는 경우까지는 잡지 못합니다.
+     *     (AutoRetransmission=DISABLE 이므로 재시도하지 않습니다)
+     *     그래도 무조건 비우기보다 확실히 낫습니다. */
+    if (HAL_CAN_AddTxMessage(&hcan, &tx_hdr, tx_data, &tx_mailbox) == HAL_OK)
+    {
+        s_fb_fl_accum = 0;
+        s_fb_fr_accum = 0;
 #if USE_RR_ENCODER
-    s_fb_rr_accum = 0;
+        s_fb_rr_accum = 0;
 #endif
-
-    (void)HAL_CAN_AddTxMessage(&hcan, &tx_hdr, tx_data, &tx_mailbox);
+    }
 }
 
 void Motor_Stop(void)
