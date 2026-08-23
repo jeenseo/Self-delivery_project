@@ -1,46 +1,59 @@
 /**
  * @file   motor.c
- * @brief  STM32 메카넘 4-휠 모터 제어 — 하이브리드 PID/Open-Loop
- *         ★ v2: 명령 워치독(Command Watchdog) 추가
+ * @brief  메카넘 4륜 독립 제어 — 단일 모드 (모드 전환 제거)
  *
- * [아키텍처: 하이브리드 제어 전략]  ※ v1 그대로 유지
+ * ============================================================================
+ * 설계 근거
+ * ============================================================================
  *
- *   2개 엔코더(TIM3=Left, TIM4=Right)로 메카넘 4-휠을 제어하는 근본적 문제:
- *   스트레이핑(Vy) 시 FL↑RL↓ 또는 FL↓RL↑ → 좌측 엔코더 평균 ≈ 0 → PID 오작동
+ * [기존 구조의 문제 — 하이브리드 모드 전환]
+ *   구버전은 implied_Vy 로 게걸음을 감지해 두 모드를 오갔습니다.
+ *     CLOSED_LOOP : (fl+rl)/2 평균 목표 -> 좌/우 PID -> 앞뒤 같은 PWM
+ *     OPEN_LOOP   : 4채널 독립 FF, PID 완전 우회
+ *   세 가지가 문제였습니다.
+ *     1) 전환 순간 PID 적분이 리셋되고 FF+PID -> FF only 로 바뀌어 PWM 이 튐
+ *     2) OPEN_LOOP 구간은 **피드백이 0** — RL 부상으로 생기는 편차를 아무도 못 잡음
+ *     3) 임계(500) 근처에서 모드가 떨릴 수 있음
+ *   게걸음 중 관측된 '꿀렁임' 은 2번이 주원인입니다. 개루프로 달리니
+ *   비대칭(좌측 접지 1바퀴 / 우측 2바퀴)이 그대로 궤적에 나타납니다.
  *
- *   해결: 스트레이핑 여부를 감지하여 두 모드로 동적 전환
- *     [CTRL_CLOSED_LOOP] 순수 X/Yaw 이동 : 좌/우 평균 PID
- *     [CTRL_OPEN_LOOP]   스트레이핑 감지 : 4바퀴 독립 2단계 피드포워드
+ * [v4 구조 — 단일 모드]
+ *   항상 4채널 독립 피드포워드 + 측면 PID 트림.
+ *     - 바퀴마다 자기 목표로 FF 계산       -> 게걸음이 성립 (fl 과 rl 부호가 달라도 됨)
+ *     - PID 는 엔코더가 있는 앞바퀴에서만 계산
+ *     - 그 보정을 같은 쪽 뒷바퀴에 **부호를 맞춰** 적용
  *
- * ═══════════════════════════════════════════════════════════════════════════
- * ★ v2 변경점 — 명령 워치독
- * ═══════════════════════════════════════════════════════════════════════════
+ *   [부호 맞춤이 왜 필요한가]
+ *     corr 은 "부하를 이기려면 더 필요한 PWM" 입니다.
+ *     전진처럼 앞뒤 목표 부호가 같으면 그대로 더하면 되지만,
+ *     게걸음은 fl 과 rl 의 부호가 반대이므로 뒷바퀴에는 -corr 을 줘야
+ *     '같은 방향으로 더 밀어주는' 의미가 됩니다.
  *
- *   [폭주(Runaway)의 메커니즘]
- *     PWM 레지스터(__HAL_TIM_SET_COMPARE)는 한 번 쓰면 다시 쓸 때까지 그 값을
- *     유지합니다. 즉 명령 소스(Pi)가 사라져도 모터는 마지막 듀티로 계속 돕니다.
- *     "정지 명령이 오지 않으면 정지한다"가 아니라 "정지 명령이 와야 정지한다"가
- *     기존 동작이었고, 이것이 정확히 폭주의 정체입니다.
+ *   [왜 이 근사가 충분한가]
+ *     피드포워드가 PWM 의 약 97% 를 만듭니다(PID 권한 ~1/34).
+ *     뒷바퀴가 개루프에 가깝다는 점은 구버전 OPEN_LOOP 와 같지만,
+ *     **앞바퀴는 항상 폐루프**라는 점이 결정적으로 다릅니다.
  *
- *   [해결 원리 — 페일세이프(Fail-Safe) 전환]
- *     명령의 '부재'를 곧 '정지 명령'으로 해석하도록 논리를 뒤집습니다.
- *       - Motor_Drive() 가 불릴 때마다 타임스탬프 갱신 (= 하트비트 수신)
- *       - Motor_PID_Update() 가 매 10ms 마다 경과 시간 검사
- *       - CMD_TIMEOUT_MS 초과 시 목표/명령/PWM 을 전부 0 으로 강제
+ * [메카넘 기구학 — 검산]
+ *   X-구성 정기구학 (바퀴 접지면 속도, l = (track+wheelbase)/2 = 0.505):
+ *     v_fl = vx - vy - l*wz      v_fr = vx + vy + l*wz
+ *     v_rl = vx + vy - l*wz      v_rr = vx - vy + l*wz
  *
- *   [부팅 시 상태 = '두절'로 시작]
- *     s_cmd_received_once = 0 이므로 첫 CAN 명령을 받기 전에는 워치독이 발동
- *     상태입니다. 전원 인가 직후 노이즈로 PWM 이 튀는 상황을 원천 차단합니다.
+ *   ★ 각 식은 서로 독립입니다. 그래서 이 펌웨어는 역기구학을 **풀지 않습니다.**
+ *     ROS 의 motor_node 가 이미 위 식으로 4개 값을 만들어 CAN 으로 보냅니다.
+ *     펌웨어는 받은 4개를 각각 RPM 목표로 바꿔 추종하기만 하면 됩니다.
+ *     -> 여기서 기구학이 꼬일 여지가 구조적으로 없습니다.
  *
- *   [HAL_GetTick() 오버플로 안전]
- *     uint32_t 뺄셈 (now - last) 은 32비트 랩어라운드(약 49.7일) 시에도
- *     모듈러 산술에 의해 올바른 경과 시간을 반환합니다.
- *     ※ (now > last) 같은 대소 비교로 짜면 49.7일마다 워치독이 영구 발동합니다.
+ *   RL 이 떠도 마찬가지입니다. 접지 3륜(FL,FR,RR)은 구속 3개 / 자유도 3개로
+ *   det = 4l = 2.020 != 0, 즉 정확히 결정계이며 **IK 공식이 바뀌지 않습니다.**
+ *   RL 은 자기 몫의 올바른 속도로 돌다가, 떠 있으면 기여가 없을 뿐입니다.
+ *   (구버전은 RL 에 FL 의 PWM 을 복사해 넣어서, RL 이 닿는 순간 충돌했습니다)
  *
- *   [주의 — 이 워치독의 한계]
- *     Motor_PID_Update() 는 메인 루프에서 호출됩니다. 메인 루프 자체가 블로킹
- *     되면(예: printf 의 HAL_UART_Transmit(HAL_MAX_DELAY)) 이 워치독도 함께
- *     멈춥니다. 그래서 main.c 에 IWDG(독립 워치독)를 별도로 추가했습니다.
+ * [타이머 배치]
+ *   TIM2 : PWM x4  (CH1=PA0 RL, CH2=PA1 RR, CH3=PB10 FL, CH4=PB11 FR)
+ *   TIM3 : FL 엔코더 (PB4,PB5, partial remap)
+ *   TIM4 : FR 엔코더 (PB6,PB7)
+ *   TIM1 : ★ 해방됨 -> Phase 3 에서 RR 엔코더 (PA8,PA9)
  */
 
 #include "motor.h"
@@ -49,86 +62,74 @@
 #include <string.h>
 #include <math.h>
 
-/* ── 외부 핸들 ───────────────────────────────────────────────── */
-extern TIM_HandleTypeDef htim1;   /* FL(CH1)/FR(CH2) PWM */
-extern TIM_HandleTypeDef htim2;   /* RL(CH1)/RR(CH2) PWM */
-extern TIM_HandleTypeDef htim3;   /* 좌측 엔코더 */
-extern TIM_HandleTypeDef htim4;   /* 우측 엔코더 */
-extern CAN_HandleTypeDef hcan;    /* CAN1 */
+/* ── 외부 핸들 ─────────────────────────────────────────────────────────── */
+extern TIM_HandleTypeDef htim2;   /* PWM x4 */
+extern TIM_HandleTypeDef htim3;   /* FL 엔코더 */
+extern TIM_HandleTypeDef htim4;   /* FR 엔코더 */
+#if USE_RR_ENCODER
+extern TIM_HandleTypeDef htim1;   /* RR 엔코더 (Phase 3) */
+#endif
+extern CAN_HandleTypeDef hcan;
 
-/* ── 내부 상수 ───────────────────────────────────────────────── */
+/* ── 내부 상수 ─────────────────────────────────────────────────────────── */
 #define PID_PERIOD_S        (PID_PERIOD_MS * 0.001f)
-
 #define KINETIC_PWM_SLOPE   ((float)(MOTOR_PWM_MAX - KINETIC_PWM_BASE) \
                              / (MOTOR_MAX_RPM - SMOOTH_RPM))
-
-#define STRAFE_DETECT_THRESHOLD  500.0f
-
-#define CLAMP(x, lo, hi)    ((x)<(lo)?(lo):((x)>(hi)?(hi):(x)))
-
 #define INTEGRAL_LIMIT      (MOTOR_MAX_RPM * 2.0f)
+#define CLAMP(x, lo, hi)    ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
 
-/* ── 제어 상태 열거형 ─────────────────────────────────────────── */
-typedef enum {
-    CTRL_CLOSED_LOOP = 0,
-    CTRL_OPEN_LOOP   = 1,
-} ControlState_t;
-
-/* ── PID 상태 구조체 ─────────────────────────────────────────── */
+/* ── PID 상태 ──────────────────────────────────────────────────────────── */
 typedef struct {
     float target_rpm;
     float integral;
     float prev_error;
 } PID_t;
 
-/* ── 모듈 내부 상태 ──────────────────────────────────────────── */
-static PID_t          s_pid_left;
-static PID_t          s_pid_right;
-static ControlState_t s_ctrl_state = CTRL_CLOSED_LOOP;
+static PID_t s_pid_fl;
+static PID_t s_pid_fr;
+#if USE_RR_ENCODER
+static PID_t s_pid_rr;
+#endif
 
-static int16_t s_cmd_fl = 0;
-static int16_t s_cmd_fr = 0;
-static int16_t s_cmd_rl = 0;
-static int16_t s_cmd_rr = 0;
+/* ── 4바퀴 명령 (CAN 원시값) ───────────────────────────────────────────── */
+static volatile int16_t s_cmd_fl = 0;
+static volatile int16_t s_cmd_fr = 0;
+static volatile int16_t s_cmd_rl = 0;
+static volatile int16_t s_cmd_rr = 0;
 
-static int32_t s_enc_left_last  = 0;
-static int32_t s_enc_right_last = 0;
+/* ── 엔코더 ────────────────────────────────────────────────────────────── */
+static int32_t s_enc_fl_last = 0;
+static int32_t s_enc_fr_last = 0;
+static int32_t s_fb_fl_accum = 0;
+static int32_t s_fb_fr_accum = 0;
+#if USE_RR_ENCODER
+static int32_t s_enc_rr_last = 0;
+static int32_t s_fb_rr_accum = 0;
+#endif
 
-static int32_t s_fb_left_accum  = 0;
-static int32_t s_fb_right_accum = 0;
-
-/* ── ★ v2: 워치독 상태 ──────────────────────────────────────── */
-/* volatile: Motor_Drive() 는 메인 루프에서 불리지만, 향후 ISR 직결로 바꿔도
- * 안전하도록 미리 volatile 로 선언합니다. */
+/* ── 안전 상태 ─────────────────────────────────────────────────────────── */
+/* 슬루 제한용 직전 PWM (부호 포함) */
+static int16_t  s_pwm_fl = 0, s_pwm_fr = 0, s_pwm_rl = 0, s_pwm_rr = 0;
+/* 스톨 감지 타이머 */
+static uint32_t s_stall_since_l = 0U;
+static uint32_t s_stall_since_r = 0U;
+static uint8_t  s_stall_tripped = 0U;
+/* 명령 워치독 (volatile: ISR 에서 갱신될 수 있음) */
 static volatile uint32_t s_last_cmd_tick     = 0U;
 static volatile uint8_t  s_cmd_received_once = 0U;
-/* 1 = 두절(강제 정지 중). 부팅 시 '두절'에서 시작 = 페일세이프 */
-static uint8_t           s_watchdog_tripped  = 1U;
-/* 통계: 워치독이 몇 번 발동했는가 (진단용) */
-static uint32_t          s_watchdog_trip_count = 0U;
+static uint8_t  s_watchdog_tripped    = 1U;   /* 시작은 '두절' = 페일세이프 */
+static uint32_t s_watchdog_trip_count = 0U;
+/* PWM 타이머가 시작되기 전에는 레지스터를 만지지 않습니다 */
+static uint8_t  s_hw_ready = 0U;
 
-/* ★ v2: 하드웨어 준비 완료 플래그
- *
- *   [왜 필요한가]
- *   Error_Handler() 가 Motor_Stop() 을 호출하도록 바꿨는데, Error_Handler 는
- *   SystemClock_Config() 안에서도 불릴 수 있습니다. 그 시점에는 MX_TIM1_Init()
- *   이전이라 htim1.Instance 가 NULL 이고, __HAL_TIM_SET_COMPARE 가 NULL 을
- *   역참조해 HardFault 가 납니다. GPIOC 도 클럭이 아직 안 켜져 있습니다.
- *
- *   [안전한 이유]
- *   이 플래그가 0 인 시점에는 PWM 타이머가 아직 시작되지 않았으므로
- *   CCR 레지스터는 리셋값 0 = 모터 정지 상태입니다. 아무것도 안 해도 안전합니다. */
-static uint8_t           s_hw_ready = 0U;
-
-/* ════════════════════════════════════════════════════════════════
- *  내부 헬퍼: DIR+PWM 단일 채널 설정 (Sign-Magnitude)
- * ════════════════════════════════════════════════════════════════ */
-static void _set_wheel(uint16_t           pin_dir,
-                       TIM_HandleTypeDef *tim,
-                       uint32_t           ch,
-                       int16_t            speed,
-                       uint8_t            invert)
+/* ═══════════════════════════════════════════════════════════════════════
+ *  내부: DIR + PWM 단일 채널 (Sign-Magnitude). 슬루/상한 없음 = 즉시 반영
+ * ═══════════════════════════════════════════════════════════════════════ */
+static void _set_wheel_raw(uint16_t pin_dir, uint32_t ch,
+                           int16_t speed, uint8_t invert)
 {
+    if (!s_hw_ready) return;
+
     if (speed >  (int16_t)MOTOR_PWM_MAX) speed =  (int16_t)MOTOR_PWM_MAX;
     if (speed < -(int16_t)MOTOR_PWM_MAX) speed = -(int16_t)MOTOR_PWM_MAX;
 
@@ -137,46 +138,52 @@ static void _set_wheel(uint16_t           pin_dir,
 
     if      (speed > 0) dir = invert ? GPIO_PIN_RESET : GPIO_PIN_SET;
     else if (speed < 0) dir = invert ? GPIO_PIN_SET   : GPIO_PIN_RESET;
-    else { dir = GPIO_PIN_RESET; pwm = 0U; }
+    else                { dir = GPIO_PIN_RESET; pwm = 0U; }
 
-    HAL_GPIO_WritePin(GPIOC, pin_dir, dir);
-    __HAL_TIM_SET_COMPARE(tim, ch, pwm);
+    HAL_GPIO_WritePin(MOTOR_DIR_PORT, pin_dir, dir);
+    __HAL_TIM_SET_COMPARE(&htim2, ch, pwm);
 }
 
-/* ════════════════════════════════════════════════════════════════
- *  ★ v2 내부 헬퍼: 4채널 PWM 즉시 0 (워치독/정지 공용)
- * ════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════
+ *  내부: 안전 경로 (절대 상한 -> 슬루 제한 -> 출력)
+ *
+ *  ★ 정상 주행 명령은 반드시 이 함수를 통과합니다.
+ *    비상정지(_all_wheels_off / Motor_Stop)만 _set_wheel_raw 를 직접 씁니다.
+ *    "멈추는 것"에 슬루를 걸면 안 되기 때문입니다.
+ * ═══════════════════════════════════════════════════════════════════════ */
+static void _set_wheel_safe(uint16_t pin_dir, uint32_t ch,
+                            int16_t target, uint8_t invert, int16_t *prev)
+{
+    /* 1) 절대 상한 — 어떤 경로로도 이 값을 못 넘습니다 */
+    if (target >  MOTOR_PWM_SAFE_MAX) target =  MOTOR_PWM_SAFE_MAX;
+    if (target < -MOTOR_PWM_SAFE_MAX) target = -MOTOR_PWM_SAFE_MAX;
+
+    /* 2) 슬루 제한 — 돌입 전류 차단 */
+    int32_t d = (int32_t)target - (int32_t)(*prev);
+    if      (d >  MOTOR_PWM_SLEW) target = (int16_t)((int32_t)(*prev) + MOTOR_PWM_SLEW);
+    else if (d < -MOTOR_PWM_SLEW) target = (int16_t)((int32_t)(*prev) - MOTOR_PWM_SLEW);
+
+    *prev = target;
+    _set_wheel_raw(pin_dir, ch, target, invert);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  내부: 4채널 즉시 0 (워치독 / 스톨 / E-Stop 공용)
+ * ═══════════════════════════════════════════════════════════════════════ */
 static void _all_wheels_off(void)
 {
-    /* 페리페럴 초기화 전이면 아무것도 하지 않는다 (위 s_hw_ready 주석 참조).
-     * 이 시점의 PWM CCR 은 리셋값 0 이므로 모터는 이미 정지 상태다. */
-    if (s_hw_ready == 0U) { return; }
-
-    _set_wheel(GPIO_PIN_2, &htim1, TIM_CHANNEL_1, 0, FL_DIR_INVERT);
-    _set_wheel(GPIO_PIN_3, &htim1, TIM_CHANNEL_2, 0, FR_DIR_INVERT);
-    _set_wheel(GPIO_PIN_0, &htim2, TIM_CHANNEL_1, 0, RL_DIR_INVERT);
-    _set_wheel(GPIO_PIN_1, &htim2, TIM_CHANNEL_2, 0, RR_DIR_INVERT);
+    _set_wheel_raw(FL_DIR_PIN, FL_PWM_CH, 0, FL_DIR_INVERT);
+    _set_wheel_raw(FR_DIR_PIN, FR_PWM_CH, 0, FR_DIR_INVERT);
+    _set_wheel_raw(RL_DIR_PIN, RL_PWM_CH, 0, RL_DIR_INVERT);
+    _set_wheel_raw(RR_DIR_PIN, RR_PWM_CH, 0, RR_DIR_INVERT);
+    /* ★ 슬루 기준점도 함께 0 으로. 안 그러면 재출발 시 0 이 아닌 값에서
+     *   슬루가 시작되어 갑자기 큰 PWM 이 나갈 수 있습니다. */
+    s_pwm_fl = s_pwm_fr = s_pwm_rl = s_pwm_rr = 0;
 }
 
-/* ════════════════════════════════════════════════════════════════
- *  ★ v2 내부 헬퍼: 제어 상태 전체 초기화 (적분 윈드업 제거 포함)
- * ════════════════════════════════════════════════════════════════ */
-static void _reset_control_state(void)
-{
-    s_pid_left.target_rpm  = 0.0f;
-    s_pid_left.integral    = 0.0f;
-    s_pid_left.prev_error  = 0.0f;
-    s_pid_right.target_rpm = 0.0f;
-    s_pid_right.integral   = 0.0f;
-    s_pid_right.prev_error = 0.0f;
-
-    s_cmd_fl = s_cmd_fr = s_cmd_rl = s_cmd_rr = 0;
-    s_ctrl_state = CTRL_CLOSED_LOOP;
-}
-
-/* ════════════════════════════════════════════════════════════════
- *  내부 헬퍼: 2단계 피드포워드 PWM 계산
- * ════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════
+ *  내부: 2단계 피드포워드 (목표 RPM -> PWM, 부호 포함)
+ * ═══════════════════════════════════════════════════════════════════════ */
 static float _calc_feedforward(float target_rpm)
 {
     float abs_rpm = fabsf(target_rpm);
@@ -193,32 +200,12 @@ static float _calc_feedforward(float target_rpm)
         ff_mag = (float)KINETIC_PWM_BASE
                  + (abs_rpm - SMOOTH_RPM) * KINETIC_PWM_SLOPE;
     }
-
     return (target_rpm >= 0.0f) ? ff_mag : -ff_mag;
 }
 
-/* ════════════════════════════════════════════════════════════════
- *  내부 헬퍼: Open-Loop 단일 채널 구동 (PID 없이 FF만)
- * ════════════════════════════════════════════════════════════════ */
-static void _drive_wheel_open_loop(uint16_t           pin_dir,
-                                    TIM_HandleTypeDef *tim,
-                                    uint32_t           ch,
-                                    float              target_rpm,
-                                    uint8_t            invert)
-{
-    if (fabsf(target_rpm) < 0.5f)
-    {
-        _set_wheel(pin_dir, tim, ch, 0, invert);
-        return;
-    }
-    float ff    = _calc_feedforward(target_rpm);
-    float total = CLAMP(ff, -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
-    _set_wheel(pin_dir, tim, ch, (int16_t)total, invert);
-}
-
-/* ════════════════════════════════════════════════════════════════
- *  내부 헬퍼: PID 연산
- * ════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════
+ *  내부: PID 1스텝
+ * ═══════════════════════════════════════════════════════════════════════ */
 static float _pid_compute(PID_t *pid, float measured_rpm)
 {
     float error = pid->target_rpm - measured_rpm;
@@ -234,296 +221,326 @@ static float _pid_compute(PID_t *pid, float measured_rpm)
          + (MOTOR_KD * derivative);
 }
 
-/* ════════════════════════════════════════════════════════════════
- *  내부 헬퍼: Closed-Loop 한 쪽(좌 또는 우) 구동
- *
- *  ⚠ 구조적 주의사항 (분석 결과 기록)
- *    좌측 호출은 FL 과 RL 에 '같은 PWM' 을 내보내고, 피드백은 TIM3(=FL) 하나뿐입니다.
- *    RL 이 접지되지 않은 상태에서는 PID 가 접지된 FL 을 목표까지 끌어올리려 PWM 을
- *    올리고, 무부하 RL 이 그 PWM 을 그대로 받아 공중에서 과속 회전합니다.
- *    => 좌측 추진 = FL 1개 / 우측 추진 = FR+RR 2개 로 비대칭이 생기고 차체가 휩니다.
- *    => 기구(RL 접지) 수리가 근본 해결이며, 소프트웨어로는 보상만 가능합니다.
- * ════════════════════════════════════════════════════════════════ */
-static void _drive_side_closed(PID_t             *pid,
-                                float              measured,
-                                uint16_t           pin_a,
-                                TIM_HandleTypeDef *tim_a,
-                                uint32_t           ch_a,
-                                uint8_t            inv_a,
-                                uint16_t           pin_b,
-                                TIM_HandleTypeDef *tim_b,
-                                uint32_t           ch_b,
-                                uint8_t            inv_b)
+static void _pid_reset(PID_t *pid)
 {
-    if (fabsf(pid->target_rpm) < 0.5f)
-    {
-        _set_wheel(pin_a, tim_a, ch_a, 0, inv_a);
-        _set_wheel(pin_b, tim_b, ch_b, 0, inv_b);
-        return;
-    }
-
-    float pid_correction = _pid_compute(pid, measured);
-    float ff             = _calc_feedforward(pid->target_rpm);
-    float total          = CLAMP(ff + pid_correction,
-                                 -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
-    int16_t cmd          = (int16_t)total;
-
-    _set_wheel(pin_a, tim_a, ch_a, cmd, inv_a);
-    _set_wheel(pin_b, tim_b, ch_b, cmd, inv_b);
+    pid->integral   = 0.0f;
+    pid->prev_error = 0.0f;
 }
 
-/* ════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════════════
+ *  ★ 내부: 한 쪽(좌 또는 우) 앞/뒤 2바퀴를 독립 목표로 구동
+ *
+ *  앞바퀴 = 엔코더 있음 -> FF + PID
+ *  뒷바퀴 = 엔코더 없음 -> FF + (같은 쪽 PID 보정을 부호 맞춰 적용)
+ *
+ *  [검산] 게걸음 +vy 일 때
+ *    t_front(FL) = -a,  t_rear(RL) = +a
+ *    FF(-a) = -|ff|,  FF(+a) = +|ff|          -> 앞뒤가 반대로 돈다 ✓
+ *    corr 이 +c 라면 뒷바퀴에는 -c 를 적용
+ *      cmd_f = -|ff| + c   (앞: 목표 -a 방향으로 c 만큼 덜 밈 = 부하 보상)
+ *      cmd_r = +|ff| - c   (뒤: 목표 +a 방향으로 c 만큼 덜 밈 = 대칭)
+ *    -> 두 바퀴가 '같은 물리적 의미' 의 보정을 받습니다 ✓
+ * ═══════════════════════════════════════════════════════════════════════ */
+static void _drive_pair(PID_t *pid, float measured_rpm,
+                        float t_front, uint16_t pin_f, uint32_t ch_f,
+                        uint8_t inv_f, int16_t *prev_f,
+                        float t_rear,  uint16_t pin_r, uint32_t ch_r,
+                        uint8_t inv_r, int16_t *prev_r)
+{
+    pid->target_rpm = t_front;
+
+    float corr = 0.0f;
+    if (fabsf(t_front) >= 0.5f)
+    {
+        corr = _pid_compute(pid, measured_rpm);
+    }
+    else
+    {
+        /* 목표가 0 이면 적분을 비웁니다. 안 그러면 정지 중에 쌓입니다. */
+        _pid_reset(pid);
+    }
+
+    /* 뒷바퀴 보정 부호 맞춤 (위 검산 참조).
+     * t_front 가 0 이면 corr 도 0 이므로 곱 판정은 안전합니다. */
+    float corr_r = ((t_front * t_rear) >= 0.0f) ? corr : -corr;
+
+    int16_t cmd_f = 0;
+    int16_t cmd_r = 0;
+
+    if (fabsf(t_front) >= 0.5f)
+        cmd_f = (int16_t)CLAMP(_calc_feedforward(t_front) + corr,
+                               -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
+    if (fabsf(t_rear) >= 0.5f)
+        cmd_r = (int16_t)CLAMP(_calc_feedforward(t_rear) + corr_r,
+                               -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
+
+    _set_wheel_safe(pin_f, ch_f, cmd_f, inv_f, prev_f);
+    _set_wheel_safe(pin_r, ch_r, cmd_r, inv_r, prev_r);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  *  공개 API
- * ════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════ */
 
 void Motor_Init(void)
 {
-    memset(&s_pid_left,  0, sizeof(PID_t));
-    memset(&s_pid_right, 0, sizeof(PID_t));
+    _pid_reset(&s_pid_fl);
+    _pid_reset(&s_pid_fr);
+    s_pid_fl.target_rpm = 0.0f;
+    s_pid_fr.target_rpm = 0.0f;
+#if USE_RR_ENCODER
+    _pid_reset(&s_pid_rr);
+    s_pid_rr.target_rpm = 0.0f;
+#endif
 
     s_cmd_fl = s_cmd_fr = s_cmd_rl = s_cmd_rr = 0;
-    s_ctrl_state = CTRL_CLOSED_LOOP;
+    s_pwm_fl = s_pwm_fr = s_pwm_rl = s_pwm_rr = 0;
 
-    s_enc_left_last  = (int32_t)__HAL_TIM_GET_COUNTER(&htim3);
-    s_enc_right_last = (int32_t)__HAL_TIM_GET_COUNTER(&htim4);
+    s_enc_fl_last = (int32_t)__HAL_TIM_GET_COUNTER(&htim3);
+    s_enc_fr_last = (int32_t)__HAL_TIM_GET_COUNTER(&htim4);
+    s_fb_fl_accum = s_fb_fr_accum = 0;
+#if USE_RR_ENCODER
+    s_enc_rr_last = (int32_t)__HAL_TIM_GET_COUNTER(&htim1);
+    s_fb_rr_accum = 0;
+#endif
 
-    s_fb_left_accum  = 0;
-    s_fb_right_accum = 0;
+    s_stall_since_l = s_stall_since_r = 0U;
+    s_stall_tripped = 0U;
 
-    /* ★ v2: 워치독을 '두절' 상태로 초기화.
-     *   첫 CAN 명령을 받기 전에는 어떤 경우에도 PWM 이 나가지 않습니다. */
+    /* 첫 CAN 명령을 받기 전에는 어떤 경우에도 PWM 이 나가지 않습니다 */
     s_last_cmd_tick       = 0U;
     s_cmd_received_once   = 0U;
     s_watchdog_tripped    = 1U;
     s_watchdog_trip_count = 0U;
 
-    /* 이 시점 이후로만 PWM/GPIO 접근이 안전하다.
-     * (main.c 에서 MX_GPIO_Init / MX_TIM*_Init / HAL_TIM_PWM_Start 가 모두 끝난 뒤
-     *  Motor_Init 이 호출되는 순서를 전제로 한다) */
+    /* 이 시점 이후로만 PWM/GPIO 접근이 안전합니다 */
     s_hw_ready = 1U;
-
     _all_wheels_off();
 }
 
 /**
- * @brief CAN 수신 → 4바퀴 독립 목표 저장 + 스트레이핑 감지
- *        ★ v2: 호출될 때마다 워치독 타임스탬프를 갱신 (= 하트비트)
+ * @brief CAN 수신 -> 4바퀴 목표 저장. **평균 내지 않습니다.**
+ *
+ * 구버전은 여기서 implied_Vy 를 계산해 모드를 전환했습니다. v4 는 하지 않습니다.
+ * 모드 개념 자체를 없앴으므로 이 함수는 값 저장 + 워치독 갱신만 합니다.
  */
 void Motor_Drive(int16_t fl, int16_t fr, int16_t rl, int16_t rr)
 {
-    /* ── ★ v2: 워치독 급이기(feed) ──────────────────────────── */
-    s_last_cmd_tick     = HAL_GetTick();
-    s_cmd_received_once = 1U;
-
     s_cmd_fl = fl;
     s_cmd_fr = fr;
     s_cmd_rl = rl;
     s_cmd_rr = rr;
 
-    /* ── 스트레이핑 감지 ─────────────────────────────────────── */
-    float implied_vy = (float)(-fl + fr + rl - rr) / 4.0f;
-
-    ControlState_t new_state =
-        (fabsf(implied_vy) > STRAFE_DETECT_THRESHOLD)
-        ? CTRL_OPEN_LOOP
-        : CTRL_CLOSED_LOOP;
-
-    if (new_state != s_ctrl_state)
-    {
-        s_pid_left.integral    = 0.0f;
-        s_pid_left.prev_error  = 0.0f;
-        s_pid_right.integral   = 0.0f;
-        s_pid_right.prev_error = 0.0f;
-        s_ctrl_state = new_state;
-    }
-
-    if (s_ctrl_state == CTRL_CLOSED_LOOP)
-    {
-        int32_t left_avg  = ((int32_t)fl + (int32_t)rl) / 2;
-        int32_t right_avg = ((int32_t)fr + (int32_t)rr) / 2;
-
-        s_pid_left.target_rpm  = (float)left_avg
-                                 / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
-        s_pid_right.target_rpm = (float)right_avg
-                                 / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
-
-        if (left_avg == 0)
-        {
-            s_pid_left.integral   = 0.0f;
-            s_pid_left.prev_error = 0.0f;
-        }
-        if (right_avg == 0)
-        {
-            s_pid_right.integral   = 0.0f;
-            s_pid_right.prev_error = 0.0f;
-        }
-    }
+    s_last_cmd_tick     = HAL_GetTick();
+    s_cmd_received_once = 1U;
 }
 
-/**
- * @brief PID 1 사이클 실행 (10ms 주기)
- *        ★ v2: 제어 전에 명령 워치독을 먼저 검사
- */
 void Motor_PID_Update(void)
 {
-    /* ════════════════════════════════════════════════════════════
-     *  [1] 엔코더 읽기 + 누산  ─ 워치독 상태와 무관하게 항상 수행
-     *
-     *  이유: 통신이 끊겨도 로봇은 관성으로 굴러갑니다. 그 이동량을 놓치면
-     *        통신 복구 후 오도메트리에 '순간 점프'가 생겨 EKF 가 흔들립니다.
-     *        정지시키는 것과 계측하는 것은 별개입니다.
-     * ════════════════════════════════════════════════════════════ */
-    int32_t cur_left  = (int32_t)__HAL_TIM_GET_COUNTER(&htim3);
-    int32_t cur_right = (int32_t)__HAL_TIM_GET_COUNTER(&htim4);
+    /* ── [1] 엔코더 읽기 + 누산 (워치독 상태와 무관하게 항상) ──────────
+     *   통신이 끊겨도 로봇은 관성으로 굴러갑니다. 그 이동량을 놓치면
+     *   복구 후 오도메트리에 점프가 생겨 EKF 가 흔들립니다.
+     *   정지시키는 것과 계측하는 것은 별개입니다. */
+    int32_t cur_fl = (int32_t)__HAL_TIM_GET_COUNTER(&htim3);
+    int32_t cur_fr = (int32_t)__HAL_TIM_GET_COUNTER(&htim4);
 
-    int16_t delta_left  = (int16_t)((uint16_t)cur_left  - (uint16_t)s_enc_left_last);
-    int16_t delta_right = (int16_t)((uint16_t)cur_right - (uint16_t)s_enc_right_last);
+    int16_t d_fl = (int16_t)((uint16_t)cur_fl - (uint16_t)s_enc_fl_last);
+    int16_t d_fr = (int16_t)((uint16_t)cur_fr - (uint16_t)s_enc_fr_last);
+    s_enc_fl_last = cur_fl;
+    s_enc_fr_last = cur_fr;
+    s_fb_fl_accum += (int32_t)d_fl;
+    s_fb_fr_accum += (int32_t)d_fr;
 
-    s_enc_left_last  = cur_left;
-    s_enc_right_last = cur_right;
+    const float rpm_scale = 60.0f / ((float)ENCODER_CPR * PID_PERIOD_S);
+    float meas_fl = (float)d_fl * rpm_scale;
+    float meas_fr = (float)d_fr * rpm_scale;
 
-    s_fb_left_accum  += (int32_t)delta_left;
-    s_fb_right_accum += (int32_t)delta_right;
+#if USE_RR_ENCODER
+    int32_t cur_rr = (int32_t)__HAL_TIM_GET_COUNTER(&htim1);
+    int16_t d_rr   = (int16_t)((uint16_t)cur_rr - (uint16_t)s_enc_rr_last);
+    s_enc_rr_last  = cur_rr;
+    s_fb_rr_accum += (int32_t)d_rr;
+    float meas_rr  = (float)d_rr * rpm_scale;
+#endif
 
-    float rpm_scale   = 60.0f / ((float)ENCODER_CPR * PID_PERIOD_S);
-    float meas_left   = (float)delta_left  * rpm_scale;
-    float meas_right  = (float)delta_right * rpm_scale;
-
-    /* ════════════════════════════════════════════════════════════
-     *  [2] ★ v2: 명령 워치독 판정
-     *
-     *  volatile 변수는 한 번만 읽어 지역 변수에 복사합니다.
-     *  (판정 도중 ISR/다른 경로가 값을 바꿔도 판정 일관성이 깨지지 않도록)
-     * ════════════════════════════════════════════════════════════ */
+    /* ── [2] 명령 워치독 ────────────────────────────────────────────────
+     *   volatile 은 한 번만 읽어 지역변수로 복사합니다.
+     *   판정 도중 ISR 이 값을 바꿔도 판정 일관성이 깨지지 않도록. */
     uint32_t now       = HAL_GetTick();
     uint32_t last_tick = s_last_cmd_tick;
     uint8_t  ever      = s_cmd_received_once;
 
-    /* uint32_t 뺄셈은 랩어라운드(49.7일)에서도 모듈러 산술로 올바르게 동작.
-     * 절대 (now > last_tick + TIMEOUT) 형태로 쓰지 말 것 — 오버플로에 취약. */
-    uint8_t timed_out = (ever == 0U) || ((now - last_tick) > CMD_TIMEOUT_MS);
+    uint8_t stale = (!ever) || ((now - last_tick) > CMD_TIMEOUT_MS);
 
-    if (timed_out)
+    if (stale)
     {
-        if (s_watchdog_tripped == 0U)
+        if (!s_watchdog_tripped)
         {
-            /* 정상 → 두절 전이: 이때 한 번만 상태를 완전 초기화 */
             s_watchdog_tripped = 1U;
             s_watchdog_trip_count++;
-            _reset_control_state();
         }
-
-        /* 매 주기 재확정.
-         * 전이 시 1회만 끄지 않고 반복해서 0 을 쓰는 이유:
-         *   - 어떤 경로로든 PWM 레지스터가 다시 쓰이면 즉시 덮어씁니다
-         *   - 노이즈/글리치로 레지스터가 변조돼도 10ms 안에 복구됩니다
-         * 비용은 GPIO 4회 + 레지스터 4회 = 무시할 수준입니다. */
+        s_cmd_fl = s_cmd_fr = s_cmd_rl = s_cmd_rr = 0;
+        _pid_reset(&s_pid_fl);
+        _pid_reset(&s_pid_fr);
+#if USE_RR_ENCODER
+        _pid_reset(&s_pid_rr);
+#endif
         _all_wheels_off();
         return;
     }
+    s_watchdog_tripped = 0U;
 
-    if (s_watchdog_tripped != 0U)
+    /* ── [3] 스톨 감지 ──────────────────────────────────────────────────
+     *   PWM 은 크게 나가는데 바퀴가 안 도는 상태 = 물림 / 과부하.
+     *   그대로 두면 모터와 드라이버가 열로 상합니다. */
+    int16_t apwm_l = (s_pwm_fl >= 0) ? s_pwm_fl : (int16_t)(-s_pwm_fl);
+    int16_t apwm_r = (s_pwm_fr >= 0) ? s_pwm_fr : (int16_t)(-s_pwm_fr);
+
+    if ((apwm_l > STALL_PWM_THRESH) && (fabsf(meas_fl) < STALL_RPM_THRESH))
     {
-        /* 두절 → 정상 복귀.
-         * 적분항을 반드시 비웁니다. 두절 동안 쌓인 값이 남아 있으면
-         * 복귀 순간 큰 PWM 이 튀어나가 로봇이 앞으로 튑니다(windup kick). */
-        s_watchdog_tripped = 0U;
-        s_pid_left.integral    = 0.0f;
-        s_pid_left.prev_error  = 0.0f;
-        s_pid_right.integral   = 0.0f;
-        s_pid_right.prev_error = 0.0f;
+        if (s_stall_since_l == 0U) s_stall_since_l = now;
+    }
+    else s_stall_since_l = 0U;
+
+    if ((apwm_r > STALL_PWM_THRESH) && (fabsf(meas_fr) < STALL_RPM_THRESH))
+    {
+        if (s_stall_since_r == 0U) s_stall_since_r = now;
+    }
+    else s_stall_since_r = 0U;
+
+    uint8_t stall_l = (s_stall_since_l != 0U) && ((now - s_stall_since_l) > STALL_HOLD_MS);
+    uint8_t stall_r = (s_stall_since_r != 0U) && ((now - s_stall_since_r) > STALL_HOLD_MS);
+
+    if (stall_l || stall_r)
+    {
+        s_stall_tripped = 1U;
+        _pid_reset(&s_pid_fl);
+        _pid_reset(&s_pid_fr);
+#if USE_RR_ENCODER
+        _pid_reset(&s_pid_rr);
+#endif
+        _all_wheels_off();
+        /* 명령이 0 으로 돌아오면 자동 해제됩니다(아래 [4] 진입 시). */
+        return;
     }
 
-    /* ════════════════════════════════════════════════════════════
-     *  [3] 제어 모드 분기 (v1 그대로)
-     * ════════════════════════════════════════════════════════════ */
-    if (s_ctrl_state == CTRL_CLOSED_LOOP)
-    {
-        _drive_side_closed(&s_pid_left,  meas_left,
-                           GPIO_PIN_2, &htim1, TIM_CHANNEL_1, FL_DIR_INVERT,
-                           GPIO_PIN_0, &htim2, TIM_CHANNEL_1, RL_DIR_INVERT);
+    /* ── [4] 4채널 독립 목표 -> 구동 ────────────────────────────────────
+     *   ★ 평균 없음. 모드 전환 없음. 바퀴마다 자기 목표. */
+    const float k = MOTOR_MAX_RPM / (float)MOTOR_PWM_MAX;
+    float t_fl = (float)s_cmd_fl * k;
+    float t_fr = (float)s_cmd_fr * k;
+    float t_rl = (float)s_cmd_rl * k;
+    float t_rr = (float)s_cmd_rr * k;
 
-        _drive_side_closed(&s_pid_right, meas_right,
-                           GPIO_PIN_3, &htim1, TIM_CHANNEL_2, FR_DIR_INVERT,
-                           GPIO_PIN_1, &htim2, TIM_CHANNEL_2, RR_DIR_INVERT);
-    }
-    else
+    /* 전 바퀴 목표가 0 이면 스톨 래치를 해제합니다 */
+    if (s_stall_tripped &&
+        (fabsf(t_fl) < 0.5f) && (fabsf(t_fr) < 0.5f) &&
+        (fabsf(t_rl) < 0.5f) && (fabsf(t_rr) < 0.5f))
     {
-        float fl_rpm = (float)s_cmd_fl / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
-        float fr_rpm = (float)s_cmd_fr / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
-        float rl_rpm = (float)s_cmd_rl / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
-        float rr_rpm = (float)s_cmd_rr / (float)MOTOR_PWM_MAX * MOTOR_MAX_RPM;
-
-        _drive_wheel_open_loop(GPIO_PIN_2, &htim1, TIM_CHANNEL_1,
-                               fl_rpm, FL_DIR_INVERT);    /* FL */
-        _drive_wheel_open_loop(GPIO_PIN_3, &htim1, TIM_CHANNEL_2,
-                               fr_rpm, FR_DIR_INVERT);    /* FR */
-        _drive_wheel_open_loop(GPIO_PIN_0, &htim2, TIM_CHANNEL_1,
-                               rl_rpm, RL_DIR_INVERT);    /* RL */
-        _drive_wheel_open_loop(GPIO_PIN_1, &htim2, TIM_CHANNEL_2,
-                               rr_rpm, RR_DIR_INVERT);    /* RR */
+        s_stall_tripped = 0U;
+        s_stall_since_l = s_stall_since_r = 0U;
     }
+    if (s_stall_tripped) { _all_wheels_off(); return; }
+
+    /* 좌측: 앞 FL(엔코더) + 뒤 RL */
+    _drive_pair(&s_pid_fl, meas_fl,
+                t_fl, FL_DIR_PIN, FL_PWM_CH, FL_DIR_INVERT, &s_pwm_fl,
+                t_rl, RL_DIR_PIN, RL_PWM_CH, RL_DIR_INVERT, &s_pwm_rl);
+
+#if USE_RR_ENCODER
+    /* Phase 3: RR 도 자기 엔코더로 독립 폐루프.
+     *   FR 은 단독 폐루프(뒤에 딸린 바퀴 없음)이므로 t_rear 에 자기 자신을 넣어
+     *   같은 함수를 재사용하지 않고 개별 처리합니다. */
+    {
+        s_pid_fr.target_rpm = t_fr;
+        float corr_fr = 0.0f;
+        if (fabsf(t_fr) >= 0.5f) corr_fr = _pid_compute(&s_pid_fr, meas_fr);
+        else                     _pid_reset(&s_pid_fr);
+        int16_t cmd_fr = 0;
+        if (fabsf(t_fr) >= 0.5f)
+            cmd_fr = (int16_t)CLAMP(_calc_feedforward(t_fr) + corr_fr,
+                                    -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
+        _set_wheel_safe(FR_DIR_PIN, FR_PWM_CH, cmd_fr, FR_DIR_INVERT, &s_pwm_fr);
+
+        s_pid_rr.target_rpm = t_rr;
+        float corr_rr = 0.0f;
+        if (fabsf(t_rr) >= 0.5f) corr_rr = _pid_compute(&s_pid_rr, meas_rr);
+        else                     _pid_reset(&s_pid_rr);
+        int16_t cmd_rr = 0;
+        if (fabsf(t_rr) >= 0.5f)
+            cmd_rr = (int16_t)CLAMP(_calc_feedforward(t_rr) + corr_rr,
+                                    -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
+        _set_wheel_safe(RR_DIR_PIN, RR_PWM_CH, cmd_rr, RR_DIR_INVERT, &s_pwm_rr);
+    }
+#else
+    /* 우측: 앞 FR(엔코더) + 뒤 RR */
+    _drive_pair(&s_pid_fr, meas_fr,
+                t_fr, FR_DIR_PIN, FR_PWM_CH, FR_DIR_INVERT, &s_pwm_fr,
+                t_rr, RR_DIR_PIN, RR_PWM_CH, RR_DIR_INVERT, &s_pwm_rr);
+#endif
 }
 
-/**
- * @brief 엔코더 피드백 CAN 전송 (20ms 주기)
+/* ═══════════════════════════════════════════════════════════════════════
+ *  CAN 피드백
  *
- * CAN ID 0x124, Payload 4B Big-Endian:
- *   Byte 0-1: int16 left_ticks   (실제로는 FL 한 바퀴)
- *   Byte 2-3: int16 right_ticks  (실제로는 FR 한 바퀴)
- *
- * ⚠ 정정 (분석 결과)
- *   기존 주석은 "Left/Right 평균이 Vy 항을 소거하므로 X 및 Yaw 를 2-엔코더로
- *   정확히 추정 가능"이라고 되어 있었으나, 이는 좌측 엔코더가 (FL+RL)/2 일 때만
- *   성립합니다. 실제로는 FL 한 바퀴뿐이므로 메카넘 IK 상
- *       (FL + FR)/2      = Vx              ← Vx 는 정확 (Vy, Wz 완전 소거)
- *       (FR − FL)/(2·l)  = Wz + Vy/l       ← Yaw 는 Vy 에 오염 (1/l = 1.98)
- *   따라서 Pi 측 EKF 는 이 피드백에서 Vx 만 사용해야 합니다.
- */
+ *  ★ DLC 는 4(2채널) 또는 6(3채널). **8 을 쓰지 마십시오.**
+ *    SocketCAN 에러 프레임이 항상 DLC=8 이라, ROS 측의
+ *    "DLC 를 정확히 N 으로 요구" 방어층이 무력화됩니다.
+ * ═══════════════════════════════════════════════════════════════════════ */
 void Motor_Send_Feedback_CAN(void)
 {
     CAN_TxHeaderTypeDef tx_hdr = {0};
-    uint8_t             tx_data[4] = {0};
     uint32_t            tx_mailbox;
 
-    int16_t lt = (int16_t)CLAMP(s_fb_left_accum,  -32768, 32767);
-    int16_t rt = (int16_t)CLAMP(s_fb_right_accum, -32768, 32767);
+#if USE_RR_ENCODER
+    uint8_t tx_data[6] = {0};
+    const uint32_t dlc = 6U;
+#else
+    uint8_t tx_data[4] = {0};
+    const uint32_t dlc = 4U;
+#endif
 
-    tx_data[0] = (uint8_t)((lt >> 8) & 0xFF);
-    tx_data[1] = (uint8_t)( lt       & 0xFF);
-    tx_data[2] = (uint8_t)((rt >> 8) & 0xFF);
-    tx_data[3] = (uint8_t)( rt       & 0xFF);
+    int16_t t_fl = (int16_t)CLAMP(s_fb_fl_accum, -32768, 32767);
+    int16_t t_fr = (int16_t)CLAMP(s_fb_fr_accum, -32768, 32767);
+
+    tx_data[0] = (uint8_t)((t_fl >> 8) & 0xFF);
+    tx_data[1] = (uint8_t)( t_fl       & 0xFF);
+    tx_data[2] = (uint8_t)((t_fr >> 8) & 0xFF);
+    tx_data[3] = (uint8_t)( t_fr       & 0xFF);
+#if USE_RR_ENCODER
+    int16_t t_rr = (int16_t)CLAMP(s_fb_rr_accum, -32768, 32767);
+    tx_data[4] = (uint8_t)((t_rr >> 8) & 0xFF);
+    tx_data[5] = (uint8_t)( t_rr       & 0xFF);
+#endif
 
     tx_hdr.StdId              = CAN_FEEDBACK_ID;
     tx_hdr.IDE                = CAN_ID_STD;
     tx_hdr.RTR                = CAN_RTR_DATA;
-    tx_hdr.DLC                = 4U;
+    tx_hdr.DLC                = dlc;
     tx_hdr.TransmitGlobalTime = DISABLE;
 
-    s_fb_left_accum  = 0;
-    s_fb_right_accum = 0;
+    /* ★ 누산기는 '패킹 직후' 비웁니다.
+     *   AddTxMessage 가 실패해도 비우는 것이 맞습니다 — 재전송하면 같은 틱을
+     *   두 번 보내게 되어 오도메트리가 부풀려집니다. 손실이 중복보다 낫습니다. */
+    s_fb_fl_accum = 0;
+    s_fb_fr_accum = 0;
+#if USE_RR_ENCODER
+    s_fb_rr_accum = 0;
+#endif
 
     (void)HAL_CAN_AddTxMessage(&hcan, &tx_hdr, tx_data, &tx_mailbox);
 }
 
 void Motor_Stop(void)
 {
-    _reset_control_state();
+    s_cmd_fl = s_cmd_fr = s_cmd_rl = s_cmd_rr = 0;
+    _pid_reset(&s_pid_fl);
+    _pid_reset(&s_pid_fr);
+#if USE_RR_ENCODER
+    _pid_reset(&s_pid_rr);
+#endif
     _all_wheels_off();
 }
 
-/* ── ★ v2 신규: 워치독 상태 조회 ───────────────────────────── */
-
-uint8_t Motor_Watchdog_IsTripped(void)
-{
-    return s_watchdog_tripped;
-}
-
-uint32_t Motor_Watchdog_ElapsedMs(void)
-{
-    if (s_cmd_received_once == 0U)
-    {
-        return 0xFFFFFFFFU;
-    }
-    return HAL_GetTick() - s_last_cmd_tick;
-}
+uint8_t Motor_Watchdog_IsTripped(void) { return s_watchdog_tripped; }
+uint8_t Motor_Stall_IsTripped(void)    { return s_stall_tripped;    }

@@ -4,6 +4,7 @@
   * @file           : main.c
   * @brief          : STM32 모터 슬레이브 — CAN 수신 + 메카넘 PID 구동
   *                   ★ v2: 폭주(Runaway) 방지 안전 계층 추가
+  *                   ★ v4: 4채널 독립 제어 및 TIM2 PWM 리맵 적용
   *
   *  CAN 수신 프로토콜 (Pi → STM32, ID 0x123):
   *    Byte 0-1: int16_t FL  (-9999 ~ +9999)
@@ -16,44 +17,9 @@
   *    Byte 2-3: int16_t Right 누산 엔코더 틱 (TIM4)
   *
   *  메인 루프 타이밍:
-  *    10ms: Motor_PID_Update()          — 엔코더 읽기 + 워치독 + PID + PWM
+  *    10ms: Motor_PID_Update()           — 엔코더 읽기 + 워치독 + PID + PWM
   *    20ms: Motor_Send_Feedback_CAN()   — 엔코더 틱 → Pi (오도메트리)
   *  매 루프: IWDG_Refresh()              — 독립 워치독 급이기
-  *
-  * ══════════════════════════════════════════════════════════════════════════
-  * ★ v2 변경 요약 — 폭주 방지 4가지
-  * ══════════════════════════════════════════════════════════════════════════
-  *
-  *  [A] IWDG 독립 워치독 (1초)
-  *      motor.c 의 명령 워치독은 '메인 루프가 돌고 있을 때'만 동작합니다.
-  *      메인 루프가 블로킹되면 명령 워치독도 함께 멈추고 PWM 은 그대로 유지됩니다.
-  *      IWDG 는 LSI 로 독립 구동되므로 CPU 가 어디에 갇혀 있든 MCU 를 리셋하고,
-  *      리셋되면 타이머/GPIO 가 초기 상태로 돌아가 PWM 이 0 이 됩니다.
-  *      => '펌웨어가 죽어도 모터는 선다'를 보장하는 유일한 계층.
-  *
-  *  [B] ★ CAN RX 마다 호출되던 블로킹 printf 제거 — [A] 만큼 중요합니다
-  *      기존 코드는 명령 1건마다 printf 로 45자를 출력했고, usart.c 의 _write 는
-  *          HAL_UART_Transmit(&huart2, ..., HAL_MAX_DELAY)
-  *      즉 '무한 대기' 블로킹 호출입니다. 115200 baud 에서 45자 = 약 3.9 ms.
-  *        - 50 Hz 명령 시 초당 195 ms(19.5%) 를 메인 루프가 갇혀 있음
-  *        - 10ms PID 주기가 무너지고 CAN 피드백도 밀림
-  *        - UART 에러/오버런이 나면 HAL_MAX_DELAY 때문에 영원히 반환 안 함
-  *          => 그 순간 PID/워치독 정지 + PWM 유지 = 정확히 '폭주'
-  *      워치독을 추가해도 그 워치독이 이 printf 뒤에 갇히면 무의미하므로,
-  *      per-command printf 를 제거하고 1 Hz 상태 요약으로 대체했습니다.
-  *      (usart.c 의 _write 도 유한 타임아웃으로 바꾸십시오 — 별도 파일 제공)
-  *
-  *  [C] Error_Handler() 가 모터를 세우도록 수정
-  *      기존: __disable_irq(); while(1){}
-  *      인터럽트를 끄고 무한 루프에 들어가는데 PWM 은 마지막 값 그대로입니다.
-  *      즉 CAN 에러 하나로 '복구 불가능한 전속력 폭주'가 됩니다.
-  *      => 정지 먼저, 그 다음 정지 루프. IWDG 도 일부러 급이지 않아 리셋을 유도합니다.
-  *
-  *  [D] ISR 공유 변수 volatile + 원자적 스냅샷
-  *      기존 rxFL~rxRR, dataReceived 는 ISR 이 쓰고 메인이 읽는데 volatile 이
-  *      아니었습니다. -O2 이상에서 컴파일러가 레지스터에 캐싱하면 메인 루프가
-  *      갱신을 영영 못 볼 수 있고, 4개 값을 읽는 도중 ISR 이 끼어들면 서로 다른
-  *      두 명령이 섞인 '찢어진(torn)' 명령이 만들어집니다.
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -61,6 +27,7 @@
 #include "main.h"
 #include "can.h"
 #include "tim.h"
+#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -221,16 +188,26 @@ int main(void)
   MX_CAN_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
   /* printf 버퍼링 비활성화 — 즉시 출력 보장 */
   setvbuf(stdout, NULL, _IONBF, 0);
 
-  printf("\r\n[DEBUG] STM32 Motor Slave Online (v2 / Watchdog)\r\n");
+  /* v4 부팅 배너 및 시스템 정보 출력 */
+  printf("\r\n=====================================================\r\n");
+  printf("[BOOT] STM32 Motor v4  4ch-independent / TIM2 PWM x4\r\n");
+  printf("  PWM   TIM2 CH1=PA0(RL) CH2=PA1(RR) CH3=PB10(FL) CH4=PB11(FR)\r\n");
+  printf("  Enc   TIM3=FL  TIM4=FR  TIM1=%s\r\n",
+         USE_RR_ENCODER ? "RR(active)" : "reserved");
+  printf("  SAFE  PWM_MAX=%d  SLEW=%d/cycle  STALL=%lums\r\n",
+         MOTOR_PWM_SAFE_MAX, MOTOR_PWM_SLEW, (unsigned long)STALL_HOLD_MS);
+  printf("  CPR=%lu  MAX_RPM=%.0f  KP=%.1f KI=%.1f KD=%.2f\r\n",
+         (unsigned long)ENCODER_CPR, MOTOR_MAX_RPM, MOTOR_KP, MOTOR_KI, MOTOR_KD);
+  printf("  CAN RX: 0x123 | CAN TX: 0x124 | PID: 10ms\r\n");
+  printf("  CMD watchdog: %u ms | IWDG: ~1000 ms\r\n", (unsigned)CMD_TIMEOUT_MS);
   printf("=====================================================\r\n");
-  printf(" CAN RX: 0x123 | CAN TX: 0x124 | PID: 10ms\r\n");
-  printf(" CMD watchdog: %u ms | IWDG: ~1000 ms\r\n", (unsigned)CMD_TIMEOUT_MS);
-  printf("=====================================================\r\n");
+  
   Report_Reset_Cause();
 
   /* CAN 수신 준비 */
@@ -242,21 +219,26 @@ int main(void)
   if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
     Error_Handler();
 
-  /* PWM 4채널 시작
-   *   TIM1_CH1 (PA8) = FL / TIM1_CH2 (PA9) = FR
-   *   TIM2_CH1 (PA0) = RL / TIM2_CH2 (PA1) = RR */
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);   /* FL */
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);   /* FR */
+  /* ── PWM 4채널 시작 — v4: 전부 TIM2 (partial remap 2) ──────────────
+   *   TIM2_CH1 (PA0)  = RL
+   *   TIM2_CH2 (PA1)  = RR
+   *   TIM2_CH3 (PB10) = FL   ★ PA8 에서 이전
+   *   TIM2_CH4 (PB11) = FR   ★ PA9 에서 이전
+   *   TIM1 은 더 이상 PWM 이 아닙니다. Encoder Mode 로 전환됐습니다. */
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);   /* RL */
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);   /* RR */
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);   /* FL */
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);   /* FR */
 
-  /* 엔코더 2채널 시작 (TIM3=좌, TIM4=우) */
-  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
-  HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
+  /* ── 엔코더 ────────────────────────────────────────────────────── */
+  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);   /* FL (PB4,PB5) */
+  HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);   /* FR (PB6,PB7) */
+#if USE_RR_ENCODER
+  HAL_TIM_Encoder_Start(&htim1, TIM_CHANNEL_ALL);   /* RR (PA8,PA9) — Phase 3 */
+#endif
 
-  /* 모터 PID 모듈 초기화 (Motor_Drive 전 반드시 호출)
-   * ★ v2: 내부에서 워치독을 '두절' 상태로 시작하므로,
-   *        첫 CAN 명령이 오기 전까지 PWM 은 0 으로 잠깁니다. */
+  /* ★ Motor_Init() 은 반드시 PWM Start 이후에 호출하십시오.
+   *   내부 s_hw_ready 게이트가 이 시점부터 PWM 레지스터 접근을 허용합니다. */
   Motor_Init();
 
   /* 타이밍 기준 초기화 */
