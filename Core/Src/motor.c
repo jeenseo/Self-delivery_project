@@ -200,6 +200,8 @@ static float _calc_feedforward(float target_rpm)
         ff_mag = (float)KINETIC_PWM_BASE
                  + (abs_rpm - SMOOTH_RPM) * KINETIC_PWM_SLOPE;
     }
+    ff_mag *= FF_GAIN;
+
     return (target_rpm >= 0.0f) ? ff_mag : -ff_mag;
 }
 
