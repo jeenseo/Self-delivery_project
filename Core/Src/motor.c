@@ -355,7 +355,7 @@ void Motor_PID_Update(void)
 
     const float rpm_scale = 60.0f / ((float)ENCODER_CPR * PID_PERIOD_S);
     float meas_fl = (float)d_fl * rpm_scale;
-    float meas_fr = (float)d_fr * rpm_scale;
+    float meas_fr = -(float)d_fr * rpm_scale;
 
 #if USE_RR_ENCODER
     int32_t cur_rr = (int32_t)__HAL_TIM_GET_COUNTER(&htim1);
