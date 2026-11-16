@@ -134,6 +134,18 @@ extern "C" {
 /** 명령 워치독 — 이 시간 동안 CAN 명령이 없으면 전 바퀴 정지 */
 #define CMD_TIMEOUT_MS          500U
 
+/**
+ * ★ [DIAG] 벤치 시험 전용 출력 차단 빌드 (기본 0 = 비활성, 기존 동작과 동일)
+ *   1 이면 PID·FF·슬루·워치독·스톨 계산과 DIR 핀은 그대로 돌고, PWM 듀티만 0 입니다.
+ *   절차 4단계(출력 차단 상태에서 통신·계측 확인)에서 모터 전원을 물리적으로
+ *   분리할 수 없을 때만 쓰십시오. 바퀴가 돌지 않으므로 PWM>2500 명령 시
+ *   0.7 s 후 스톨 래치가 걸리는 것이 '정상' 입니다(스톨 경로 시험으로도 쓸 수 있음).
+ *   이 값은 info 레코드와 cycle 레코드 sflags bit5 에 기록됩니다.
+ */
+#ifndef MOTOR_OUTPUT_INHIBIT
+#define MOTOR_OUTPUT_INHIBIT    0
+#endif
+
 /* ═════════════════════════════════════════════════════════════════════════
  * 2단계 피드포워드 (2-Stage Piecewise Feedforward)
  *
@@ -155,6 +167,55 @@ extern "C" {
 #define STICTION_PWM_BASE       1300U
 #define KINETIC_PWM_BASE        2000U
 #define SMOOTH_RPM              31.8f
+
+/* ═════════════════════════════════════════════════════════════════════════
+ * [FFB1] 기동(KICK) / 주행(RUN) 피드포워드 분리 — 후보 B 초안 (2026-11-14)
+ *
+ *   KICK : 위 2단계 FF 그대로 (현행 C0 와 같은 값 = 출발 실측 근거가 있는 값)
+ *   RUN  : 같은 FF 에서 저속 쐐기만 뺍니다 (FF_GAIN 적용 전 PWM 단위)
+ *          |RPM| <  PIVOT : FF_run = FF_GAIN * [ Zone1(|RPM|) - DROP * (1 - |RPM|/PIVOT) ]
+ *          |RPM| >= PIVOT : FF_run = FF (변화 없음, Zone 2 포함)
+ *   KICK -> RUN : KICK 이 FF_KICK_MIN_MS 지났고, 앞바퀴가 명령 방향으로
+ *                 FF_KICK_MOVE_TICKS 이상 움직였을 때
+ *   재킥        : RUN 중 명령 방향 틱이 FF_RUN_STILL_MS 동안 없으면 KICK.
+ *                 한 에피소드에서 FF_RUN_MAX_REKICK 회를 넘으면 HOLD(에피소드 끝까지 현행 FF)
+ *   뒷바퀴      : 엔코더가 없어 같은 쪽 앞바퀴 상태를 따릅니다. 앞바퀴 목표가 0 이면 현행 FF.
+ *   PI          : 바꾸지 않습니다 (읽지도 쓰지도 않음).
+ *
+ *   ★ FF_RUN_DROP_PWM = 0 이면 모든 출력이 현행과 비트 단위로 같습니다 (호스트 시험).
+ *   ★ 시험 변수는 FF_RUN_DROP_PWM 하나입니다. 나머지는 구조 상수이며,
+ *     바꾸면 FFB_TAG 를 올려 INFO 에서 구분되게 하십시오.
+ * ═════════════════════════════════════════════════════════════════════════ */
+#ifndef FF_RUN_DROP_PWM
+#define FF_RUN_DROP_PWM         0      /**< 시험 변수: 쐐기 깊이(0 rpm 쪽) [PWM, FF_GAIN 전]. 0 = 현행과 동일 */
+#endif
+#define FF_RUN_PIVOT_RPM_X10    125      /**< 쐐기가 0 이 되는 속도 x10 = 12.5 rpm (N5-C0 오차 교차 12.45~12.8) */
+#define FF_KICK_MIN_MS          150U     /**< KICK 최소 유지 [ms] (S2 D-b 목표 첫 도달 0.16~0.18 s) */
+#define FF_KICK_MOVE_TICKS      20U      /**< KICK -> RUN 명령 방향 누적 틱 (S2: 출발 0.09~0.12 s 에 도달) */
+#define FF_RUN_STILL_MS         100U     /**< RUN 중 무틱 판정 [ms] (S2 주행 중 무틱 주기 0 건, 최소 2 틱/10 ms) */
+#define FF_RUN_MAX_REKICK       2U       /**< 에피소드당 재킥 허용 횟수. 넘으면 HOLD */
+#define FFB_TAG                 "ffB1"   /**< 구조 상수 판 번호 (INFO build 문자열 머리) */
+
+#if (FF_RUN_DROP_PWM < 0) || (FF_RUN_DROP_PWM > (STICTION_PWM_BASE / 2U))
+#error "FF_RUN_DROP_PWM: sanity range is [0, STICTION_PWM_BASE/2]"
+#endif
+#if (FF_RUN_PIVOT_RPM_X10 < 10) || (FF_RUN_PIVOT_RPM_X10 > 318)
+#error "FF_RUN_PIVOT_RPM_X10 must stay inside Zone 1 (1.0 .. 31.8 rpm)"
+#endif
+
+/* INFO 레코드 build 문자열 = "ffB1-d<DROP>-p<PIVOTx10>[-INH] <날짜> <시각>"
+ *   (motor_diag.c 가 FW_BUILD_ID 를 그대로 씁니다. 48자 제한 안)
+ *   -DFW_BUILD_ID 또는 fw_build_id.h 를 쓰면 그쪽이 이깁니다 -> 이 후보 빌드에서는 쓰지 마십시오. */
+#define FFB_STR_(x)             #x
+#define FFB_STR(x)              FFB_STR_(x)
+#if MOTOR_OUTPUT_INHIBIT
+#define FFB_INH_TAG             "-INH"
+#else
+#define FFB_INH_TAG             ""
+#endif
+#ifndef FW_BUILD_ID
+#define FW_BUILD_ID  FFB_TAG "-d" FFB_STR(FF_RUN_DROP_PWM) "-p" FFB_STR(FF_RUN_PIVOT_RPM_X10) FFB_INH_TAG
+#endif
 
 /* ═════════════════════════════════════════════════════════════════════════
  * 방향 반전 (0 = DIR HIGH 가 전진, 1 = DIR LOW 가 전진)

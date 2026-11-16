@@ -57,6 +57,7 @@
  */
 
 #include "motor.h"
+#include "motor_diag.h"
 #include "tim.h"
 #include "can.h"
 #include <string.h>
@@ -91,6 +92,23 @@ static PID_t s_pid_fr;
 static PID_t s_pid_rr;
 #endif
 
+/* ── [FFB1] 기동/주행 FF 분리 상태 (좌: FL+RL, 우: FR+RR) ──────────────── */
+#define FFB_IDLE  0U
+#define FFB_KICK  1U
+#define FFB_RUN   2U
+#define FFB_HOLD  3U
+#define FFB_TICKS_PER_RPM   ((float)ENCODER_CPR * PID_PERIOD_S / 60.0f)  /* 측정 rpm x 이 값 = 이번 주기 틱 */
+typedef struct {
+    uint8_t  st;        /* FFB_IDLE / FFB_KICK / FFB_RUN / FFB_HOLD */
+    int8_t   sf, sr;    /* 직전 주기 앞/뒤 명령 부호 (|t| < 0.5 -> 0) */
+    uint8_t  rekick;    /* 이번 에피소드 재킥 횟수 */
+    uint16_t t_ms;      /* KICK: 진입 뒤 경과 / RUN: 마지막 명령 방향 틱 뒤 경과 */
+    uint16_t moved;     /* KICK 진입 뒤 명령 방향 누적 틱 (포화) */
+    uint32_t seen;      /* 이 쪽을 마지막으로 처리한 주기 번호 */
+} FFB_t;
+static FFB_t    s_ffb_l, s_ffb_r;
+static uint32_t s_ffb_cycle = 0U;
+
 /* ── 4바퀴 명령 (CAN 원시값) ───────────────────────────────────────────── */
 static volatile int16_t s_cmd_fl = 0;
 static volatile int16_t s_cmd_fr = 0;
@@ -122,6 +140,18 @@ static uint32_t s_watchdog_trip_count = 0U;
 /* PWM 타이머가 시작되기 전에는 레지스터를 만지지 않습니다 */
 static uint8_t  s_hw_ready = 0U;
 
+/* ── [DIAG] 계측 캡처 ──────────────────────────────────────────────────
+ *  ★ 이 구조체는 '기록 전용' 입니다. 제어 계산은 이 값을 읽지 않습니다.
+ *    아래의 모든 #if MOTOR_DIAG_ENABLE 블록은 이미 계산된 값을 복사하거나,
+ *    같은 피연산자로 같은 연산을 한 번 더 해서(P = KP*error, I = KI*integral,
+ *    FF = _calc_feedforward(t)) 기록할 뿐, 제어 변수에 쓰지 않습니다. */
+#if MOTOR_DIAG_ENABLE
+#if USE_RR_ENCODER
+#error "motor_diag: USE_RR_ENCODER=1 branch is not instrumented. Set MOTOR_DIAG_ENABLE 0 or extend the capture."
+#endif
+static MotorDiagCycle_t s_dg;
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════
  *  내부: DIR + PWM 단일 채널 (Sign-Magnitude). 슬루/상한 없음 = 즉시 반영
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -139,6 +169,11 @@ static void _set_wheel_raw(uint16_t pin_dir, uint32_t ch,
     if      (speed > 0) dir = invert ? GPIO_PIN_RESET : GPIO_PIN_SET;
     else if (speed < 0) dir = invert ? GPIO_PIN_SET   : GPIO_PIN_RESET;
     else                { dir = GPIO_PIN_RESET; pwm = 0U; }
+
+#if MOTOR_OUTPUT_INHIBIT
+    /* ★ 벤치 시험 전용 빌드: 모든 계산·DIR 은 그대로, 듀티만 0. (기본값 0 = 비활성) */
+    pwm = 0U;
+#endif
 
     HAL_GPIO_WritePin(MOTOR_DIR_PORT, pin_dir, dir);
     __HAL_TIM_SET_COMPARE(&htim2, ch, pwm);
@@ -206,6 +241,79 @@ static float _calc_feedforward(float target_rpm)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ *  [FFB1] RUN 저속 쐐기: 현행 FF 에서 뺄 값 (부호 포함, FF_GAIN 적용 후 PWM)
+ *    |t| >= PIVOT 이면 0. FF_RUN_DROP_PWM = 0 이면 항상 (+/-)0 -> 출력 비트 동일.
+ * ═══════════════════════════════════════════════════════════════════════ */
+static float _ff_run_drop(float target_rpm)
+{
+    const float pivot = (float)FF_RUN_PIVOT_RPM_X10 * 0.1f;
+    float abs_rpm = fabsf(target_rpm);
+    if (abs_rpm >= pivot) return 0.0f;
+    float m = (float)FF_RUN_DROP_PWM * (1.0f - abs_rpm / pivot) * FF_GAIN;
+    return (target_rpm >= 0.0f) ? m : -m;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  [FFB1] 한 쪽(앞+뒤)의 KICK/RUN 상태 1스텝. 반환 1 = 이번 주기에 RUN FF 사용
+ *    새 에피소드(출발, 앞 부호 변화, 뒤 출발·반전, 직전 주기 미처리=워치독·스톨) -> KICK
+ *    KICK: FF_KICK_MIN_MS 경과 + 명령 방향 누적 틱 >= FF_KICK_MOVE_TICKS -> RUN
+ *    RUN : 명령 방향 틱 없이 FF_RUN_STILL_MS -> 재킥 (FF_RUN_MAX_REKICK 초과 -> HOLD)
+ *    앞 목표 0 (뒤만 구동) -> 관측할 수 없으므로 KICK = 현행 FF
+ *    PID 상태는 읽지도 쓰지도 않습니다.
+ * ═══════════════════════════════════════════════════════════════════════ */
+static uint8_t _ffb_step(FFB_t *k, float t_front, float t_rear, float meas_front)
+{
+    int8_t  sf = (t_front >= 0.5f) ? 1 : ((t_front <= -0.5f) ? -1 : 0);
+    int8_t  sr = (t_rear  >= 0.5f) ? 1 : ((t_rear  <= -0.5f) ? -1 : 0);
+    uint8_t fresh = (uint8_t)((k->seen + 1U) != s_ffb_cycle);
+    k->seen = s_ffb_cycle;
+
+    if ((sf == 0) && (sr == 0))
+    {
+        k->st = FFB_IDLE; k->sf = 0; k->sr = 0;
+        return 0U;
+    }
+    if (fresh || (k->st == FFB_IDLE) || (sf != k->sf) || ((sr != 0) && (sr != k->sr)))
+    {
+        k->st = FFB_KICK; k->t_ms = 0U; k->moved = 0U; k->rekick = 0U;
+    }
+    k->sf = sf;
+    k->sr = sr;
+    if (sf == 0) { k->st = FFB_KICK; return 0U; }
+
+    float   dir_ticks = meas_front * FFB_TICKS_PER_RPM * (float)sf;   /* 명령 방향 틱 (정수값) */
+    uint8_t moved_now = (uint8_t)(dir_ticks > 0.5f);
+
+    if (k->st == FFB_KICK)
+    {
+        if (moved_now)
+        {
+            uint32_t m = (uint32_t)k->moved + (uint32_t)(dir_ticks + 0.5f);
+            k->moved = (uint16_t)((m > 0xFFFFU) ? 0xFFFFU : m);
+        }
+        if (k->t_ms < FF_KICK_MIN_MS) k->t_ms = (uint16_t)(k->t_ms + PID_PERIOD_MS);
+        if ((k->t_ms >= FF_KICK_MIN_MS) && (k->moved >= FF_KICK_MOVE_TICKS))
+        {
+            k->st = FFB_RUN; k->t_ms = 0U;
+        }
+    }
+    else if (k->st == FFB_RUN)
+    {
+        if (moved_now) k->t_ms = 0U;
+        else if (k->t_ms < FF_RUN_STILL_MS) k->t_ms = (uint16_t)(k->t_ms + PID_PERIOD_MS);
+        if (k->t_ms >= FF_RUN_STILL_MS)
+        {
+            k->rekick++;
+            k->st   = (k->rekick > FF_RUN_MAX_REKICK) ? FFB_HOLD : FFB_KICK;
+            k->t_ms = 0U; k->moved = 0U;
+        }
+    }
+    /* FFB_HOLD: 이 에피소드가 끝날 때까지 현행 FF */
+
+    return (uint8_t)(k->st == FFB_RUN);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  *  내부: PID 1스텝
  * ═══════════════════════════════════════════════════════════════════════ */
 static float _pid_compute(PID_t *pid, float measured_rpm)
@@ -251,6 +359,10 @@ static void _drive_pair(PID_t *pid, float measured_rpm,
 {
     pid->target_rpm = t_front;
 
+    /* [FFB1] 이 쪽의 KICK/RUN 상태 (FF 선택에만 씀, PID 와 무관) */
+    uint8_t ff_run = _ffb_step((pid == &s_pid_fl) ? &s_ffb_l : &s_ffb_r,
+                               t_front, t_rear, measured_rpm);
+
     float corr = 0.0f;
     if (fabsf(t_front) >= 0.5f)
     {
@@ -268,16 +380,54 @@ static void _drive_pair(PID_t *pid, float measured_rpm,
 
     int16_t cmd_f = 0;
     int16_t cmd_r = 0;
+    float   ff_f  = 0.0f;   /* [FFB1] 이번 주기에 실제로 쓴 FF (계측도 이 값) */
+    float   ff_r  = 0.0f;
 
     if (fabsf(t_front) >= 0.5f)
-        cmd_f = (int16_t)CLAMP(_calc_feedforward(t_front) + corr,
+    {
+        ff_f = _calc_feedforward(t_front);
+        if (ff_run) ff_f -= _ff_run_drop(t_front);
+        cmd_f = (int16_t)CLAMP(ff_f + corr,
                                -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
+    }
     if (fabsf(t_rear) >= 0.5f)
-        cmd_r = (int16_t)CLAMP(_calc_feedforward(t_rear) + corr_r,
+    {
+        ff_r = _calc_feedforward(t_rear);
+        if (ff_run) ff_r -= _ff_run_drop(t_rear);
+        cmd_r = (int16_t)CLAMP(ff_r + corr_r,
                                -(float)MOTOR_PWM_MAX, (float)MOTOR_PWM_MAX);
+    }
+
+#if MOTOR_DIAG_ENABLE
+    /* [DIAG] 기록만. pid==&s_pid_fl 이면 좌(FL/RL), 아니면 우(FR/RR). */
+    MotorDiagPair_t *dp = &s_dg.pair[(pid == &s_pid_fl) ? 0 : 1];
+    dp->valid = 1U;
+    dp->act_f = (uint8_t)(fabsf(t_front) >= 0.5f);
+    dp->act_r = (uint8_t)(fabsf(t_rear)  >= 0.5f);
+    if (dp->act_f)
+    {
+        dp->p     = MOTOR_KP * pid->prev_error;   /* = _pid_compute 의 (MOTOR_KP * error) */
+        dp->i     = MOTOR_KI * pid->integral;     /* = _pid_compute 의 (MOTOR_KI * integral) */
+        dp->corr  = corr;
+        dp->ff_f  = ff_f;                         /* [FFB1] 실제로 쓴 FF (KICK 이면 현행식과 같음) */
+        dp->pre_f = dp->ff_f + corr;
+    }
+    if (dp->act_r)
+    {
+        dp->ff_r  = ff_r;                         /* [FFB1] */
+        dp->pre_r = dp->ff_r + corr_r;
+    }
+    dp->cmd_f  = cmd_f;   dp->cmd_r  = cmd_r;
+    dp->prev_f = *prev_f; dp->prev_r = *prev_r;
+#endif
 
     _set_wheel_safe(pin_f, ch_f, cmd_f, inv_f, prev_f);
     _set_wheel_safe(pin_r, ch_r, cmd_r, inv_r, prev_r);
+
+#if MOTOR_DIAG_ENABLE
+    dp->out_f = *prev_f;  /* _set_wheel_safe 가 SAFE 클램프+슬루 후 기록한 '인가 PWM' */
+    dp->out_r = *prev_r;
+#endif
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -308,6 +458,9 @@ void Motor_Init(void)
 
     s_stall_since_l = s_stall_since_r = 0U;
     s_stall_tripped = 0U;
+    memset(&s_ffb_l, 0, sizeof(s_ffb_l));   /* [FFB1] */
+    memset(&s_ffb_r, 0, sizeof(s_ffb_r));
+    s_ffb_cycle = 0U;
 
     /* 첫 CAN 명령을 받기 전에는 어떤 경우에도 PWM 이 나가지 않습니다 */
     s_last_cmd_tick       = 0U;
@@ -318,6 +471,33 @@ void Motor_Init(void)
     /* 이 시점 이후로만 PWM/GPIO 접근이 안전합니다 */
     s_hw_ready = 1U;
     _all_wheels_off();
+
+#if MOTOR_DIAG_ENABLE
+    /* [DIAG] 이 빌드에 컴파일된 상수를 info 레코드로 보냅니다 (플래시된 펌웨어 식별용) */
+    MotorDiagInfo_t inf;
+    memset(&inf, 0, sizeof(inf));
+    inf.use_rr_encoder = (uint8_t)USE_RR_ENCODER;
+    inf.output_inhibit = (uint8_t)MOTOR_OUTPUT_INHIBIT;
+    inf.inv_fl = FL_DIR_INVERT; inf.inv_fr = FR_DIR_INVERT;
+    inf.inv_rl = RL_DIR_INVERT; inf.inv_rr = RR_DIR_INVERT;
+    inf.pid_period_ms  = (uint8_t)PID_PERIOD_MS;
+    inf.encoder_cpr    = (uint16_t)ENCODER_CPR;
+    inf.pwm_max        = (uint16_t)MOTOR_PWM_MAX;
+    inf.safe_max       = (uint16_t)MOTOR_PWM_SAFE_MAX;
+    inf.slew           = (uint16_t)MOTOR_PWM_SLEW;
+    inf.stall_pwm      = (uint16_t)STALL_PWM_THRESH;
+    inf.stall_hold_ms  = (uint16_t)STALL_HOLD_MS;
+    inf.cmd_timeout_ms = (uint16_t)CMD_TIMEOUT_MS;
+    inf.fb_period_ms   = (uint16_t)CAN_FEEDBACK_PERIOD_MS;
+    inf.stiction_base  = (uint16_t)STICTION_PWM_BASE;
+    inf.kinetic_base   = (uint16_t)KINETIC_PWM_BASE;
+    inf.can_cmd_id     = (uint16_t)CAN_COMMAND_ID;
+    inf.can_fb_id      = (uint16_t)CAN_FEEDBACK_ID;
+    inf.kp = MOTOR_KP; inf.ki = MOTOR_KI; inf.kd = MOTOR_KD; inf.ff_gain = FF_GAIN;
+    inf.max_rpm = MOTOR_MAX_RPM; inf.smooth_rpm = SMOOTH_RPM;
+    inf.stall_rpm = STALL_RPM_THRESH; inf.integral_limit = INTEGRAL_LIMIT;
+    MotorDiag_SetInfo(&inf);
+#endif
 }
 
 /**
@@ -337,8 +517,12 @@ void Motor_Drive(int16_t fl, int16_t fr, int16_t rl, int16_t rr)
     s_cmd_received_once = 1U;
 }
 
-void Motor_PID_Update(void)
+/* ★ [DIAG] 원래의 Motor_PID_Update 본문입니다. 이름만 바뀌었고(공개 함수는 아래 래퍼),
+ *   제어 문장은 그대로입니다. 추가된 것은 #if MOTOR_DIAG_ENABLE 기록 블록뿐입니다. */
+static void _pid_update_core(void)
 {
+    s_ffb_cycle++;   /* [FFB1] 주기 번호: 워치독·스톨 경로로 _drive_pair 를 건너뛴 주기 검출 */
+
     /* ── [1] 엔코더 읽기 + 누산 (워치독 상태와 무관하게 항상) ──────────
      *   통신이 끊겨도 로봇은 관성으로 굴러갑니다. 그 이동량을 놓치면
      *   복구 후 오도메트리에 점프가 생겨 EKF 가 흔들립니다.
@@ -357,6 +541,15 @@ void Motor_PID_Update(void)
     float meas_fl = (float)d_fl * rpm_scale;
     float meas_fr = -(float)d_fr * rpm_scale;
 
+#if MOTOR_DIAG_ENABLE
+    /* [DIAG] 원시 틱(부호 보정 전) 과 펌웨어가 PI 에 넣는 측정 RPM 을 함께 기록
+     *        -> 수신 측이 sign(meas_fr)/sign(d_fr) 로 FR 반전이 실제로 적용됐는지 확인 */
+    s_dg.d_fl = d_fl;  s_dg.d_fr = d_fr;
+    s_dg.meas_fl = meas_fl;  s_dg.meas_fr = meas_fr;
+    s_dg.cmd[0] = s_cmd_fl; s_dg.cmd[1] = s_cmd_fr;
+    s_dg.cmd[2] = s_cmd_rl; s_dg.cmd[3] = s_cmd_rr;
+#endif
+
 #if USE_RR_ENCODER
     int32_t cur_rr = (int32_t)__HAL_TIM_GET_COUNTER(&htim1);
     int16_t d_rr   = (int16_t)((uint16_t)cur_rr - (uint16_t)s_enc_rr_last);
@@ -373,6 +566,11 @@ void Motor_PID_Update(void)
     uint8_t  ever      = s_cmd_received_once;
 
     uint8_t stale = (!ever) || ((now - last_tick) > CMD_TIMEOUT_MS);
+
+#if MOTOR_DIAG_ENABLE
+    s_dg.tick_ms = now;
+    s_dg.path    = stale ? DIAG_PATH_WD_OFF : DIAG_PATH_DRIVE;
+#endif
 
     if (stale)
     {
@@ -415,6 +613,9 @@ void Motor_PID_Update(void)
 
     if (stall_l || stall_r)
     {
+#if MOTOR_DIAG_ENABLE
+        s_dg.path = DIAG_PATH_STALL_TRIP;
+#endif
         s_stall_tripped = 1U;
         _pid_reset(&s_pid_fl);
         _pid_reset(&s_pid_fr);
@@ -441,7 +642,14 @@ void Motor_PID_Update(void)
     {
         s_stall_tripped = 0U;
         s_stall_since_l = s_stall_since_r = 0U;
+#if MOTOR_DIAG_ENABLE
+        s_dg.stall_released = 1U;
+#endif
     }
+#if MOTOR_DIAG_ENABLE
+    s_dg.tgt[0] = t_fl; s_dg.tgt[1] = t_fr; s_dg.tgt[2] = t_rl; s_dg.tgt[3] = t_rr;
+    if (s_stall_tripped) s_dg.path = DIAG_PATH_STALL_LATCHED;
+#endif
     if (s_stall_tripped) { _all_wheels_off(); return; }
 
     /* 좌측: 앞 FL(엔코더) + 뒤 RL */
@@ -479,6 +687,53 @@ void Motor_PID_Update(void)
     _drive_pair(&s_pid_fr, meas_fr,
                 t_fr, FR_DIR_PIN, FR_PWM_CH, FR_DIR_INVERT, &s_pwm_fr,
                 t_rr, RR_DIR_PIN, RR_PWM_CH, RR_DIR_INVERT, &s_pwm_rr);
+#endif
+}
+
+#if MOTOR_DIAG_ENABLE
+/** [DIAG] 주기 종료 시점의 상태를 캡처에 채웁니다 (읽기만). */
+static void _diag_finish(void)
+{
+    uint32_t now = s_dg.tick_ms;
+    s_dg.wd_tripped    = s_watchdog_tripped;
+    s_dg.stall_tripped = s_stall_tripped;
+    s_dg.cmd_ever      = s_cmd_received_once;
+    s_dg.hw_ready      = s_hw_ready;
+    s_dg.i_fl_hi = (uint8_t)(s_pid_fl.integral >=  INTEGRAL_LIMIT);
+    s_dg.i_fl_lo = (uint8_t)(s_pid_fl.integral <= -INTEGRAL_LIMIT);
+    s_dg.i_fr_hi = (uint8_t)(s_pid_fr.integral >=  INTEGRAL_LIMIT);
+    s_dg.i_fr_lo = (uint8_t)(s_pid_fr.integral <= -INTEGRAL_LIMIT);
+    uint32_t sl = (s_stall_since_l != 0U) ? (now - s_stall_since_l) : 0U;
+    uint32_t sr = (s_stall_since_r != 0U) ? (now - s_stall_since_r) : 0U;
+    s_dg.stall_l_ms = (uint16_t)((sl > 0xFFFFU) ? 0xFFFFU : sl);
+    s_dg.stall_r_ms = (uint16_t)((sr > 0xFFFFU) ? 0xFFFFU : sr);
+    if (!s_cmd_received_once) s_dg.cmd_age_ms = 0xFFFFU;
+    else
+    {
+        uint32_t age = now - s_last_cmd_tick;
+        s_dg.cmd_age_ms = (uint16_t)((age > 0xFFFEU) ? 0xFFFEU : age);
+    }
+    s_dg.wd_trip_count = s_watchdog_trip_count;
+}
+#endif
+
+/**
+ * @brief 10 ms 제어 주기 (공개 API — main.c 호출부는 변경 없음)
+ *        계측이 꺼져 있으면 원래 본문만 실행합니다.
+ */
+void Motor_PID_Update(void)
+{
+#if MOTOR_DIAG_ENABLE
+    MotorDiag_CycleBegin();
+    memset(&s_dg, 0, sizeof(s_dg));
+#endif
+
+    _pid_update_core();
+
+#if MOTOR_DIAG_ENABLE
+    MotorDiag_CycleEnd();
+    _diag_finish();
+    MotorDiag_PushCycle(&s_dg);
 #endif
 }
 
@@ -543,7 +798,16 @@ void Motor_Send_Feedback_CAN(void)
 #if USE_RR_ENCODER
         s_fb_rr_accum = 0;
 #endif
+#if MOTOR_DIAG_ENABLE
+        MotorDiag_CountFeedbackTx(1U);
+#endif
     }
+#if MOTOR_DIAG_ENABLE
+    else
+    {
+        MotorDiag_CountFeedbackTx(0U);
+    }
+#endif
 }
 
 void Motor_Stop(void)
